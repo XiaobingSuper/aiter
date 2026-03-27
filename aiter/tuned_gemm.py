@@ -17,6 +17,7 @@
 
 import functools
 import os
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -47,6 +48,86 @@ tuned_df = pd.DataFrame(
         "bpreshuffle",
     ]
 )
+
+
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_flydsl_tuned_files_():
+    tuned_files = []
+    env_files = os.getenv("AITER_CONFIG_GEMM_BF16_FLYDSL", "")
+    if env_files:
+        tuned_files.extend(path for path in env_files.split(os.pathsep) if path)
+    else:
+        for tuned_file in AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE.split(os.pathsep):
+            if not tuned_file:
+                continue
+            file_path = Path(tuned_file)
+            if file_path.name.endswith("_bf16_tuned_gemm.csv"):
+                tuned_files.append(
+                    str(
+                        file_path.with_name(
+                            file_path.name.replace(
+                                "_bf16_tuned_gemm.csv",
+                                "_flydsl_bshuffle_bf16_tuned_gemm.csv",
+                            )
+                        )
+                    )
+                )
+            elif file_path.name.endswith("bf16_tuned_gemm.csv"):
+                tuned_files.append(
+                    str(
+                        file_path.with_name(
+                            file_path.name.replace(
+                                "bf16_tuned_gemm.csv",
+                                "flydsl_bshuffle_bf16_tuned_gemm.csv",
+                            )
+                        )
+                    )
+                )
+    dedup_files = []
+    for tuned_file in tuned_files:
+        if tuned_file not in dedup_files and os.path.exists(tuned_file):
+            dedup_files.append(tuned_file)
+    return tuple(dedup_files)
+
+
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_flydsl_config_():
+    tuned_files = get_GEMM_A16W16_flydsl_tuned_files_()
+    gemm_dict = {}
+    if tuned_files:
+        merge_df = pd.concat(
+            [pd.read_csv(tuned_file) for tuned_file in tuned_files], ignore_index=True
+        )
+        if not merge_df.empty:
+            merge_df = merge_df[merge_df["libtype"] == "flydsl"].sort_values("us")
+            merge_df = merge_df.drop_duplicates(
+                subset=[
+                    "cu_num",
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
+                keep="first",
+            )
+            gemm_dict = merge_df.set_index(
+                [
+                    "cu_num",
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ]
+            ).to_dict("index")
+    return gemm_dict
 
 
 @functools.lru_cache(maxsize=1)
@@ -83,12 +164,34 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
 ):
     cfg = get_GEMM_A16W16_config_()
+    flydsl_cfg = get_GEMM_A16W16_flydsl_config_() if bpreshuffle else {}
     cu_num = get_cu_num()
     padded_M = M
     config = None
 
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        if flydsl_cfg:
+            config = flydsl_cfg.get(
+                (
+                    cu_num,
+                    padded_M,
+                    N,
+                    K,
+                    bias,
+                    str(dtype),
+                    str(otype),
+                    scaleAB,
+                    bpreshuffle,
+                ),
+                None,
+            )
+            if config is not None:
+                if AITER_LOG_TUNED_CONFIG:
+                    logger.info(
+                        f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {os.pathsep.join(get_GEMM_A16W16_flydsl_tuned_files_())}, libtype is {config['libtype']}, kernel name is {config['kernelName']}"
+                    )
+                return config
         config = cfg.get(
             (
                 cu_num,
@@ -105,7 +208,11 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
-                kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
+                kernelName = (
+                    config["kernelName"]
+                    if config["libtype"] in {"asm", "flydsl"}
+                    else ""
+                )
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
@@ -250,6 +357,22 @@ def gemm_a16w16(
         kernelName = config["kernelName"]
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
+    elif config is not None and config["libtype"] == "flydsl":
+        out = flydsl_gemm(
+            inp_view,
+            B,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            tile_k=config["tile_k"],
+            tile_m=config["tile_m"],
+            tile_n=config["tile_n"],
+            pack_n=config.get("pack", 1),
+            split_k=config["splitK"],
+            bpreshuffle=bpreshuffle,
+        )
     else:
         solution_idx = config["solidx"]
         solfunc = solMap[config["libtype"]]
@@ -391,6 +514,44 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+
+
+def flydsl_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    *,
+    tile_k: int,
+    tile_m: int,
+    tile_n: int,
+    pack_n: int = 1,
+    split_k: int = 1,
+    bpreshuffle: bool = False,
+):
+    from aiter.ops.flydsl import flydsl_hgemm
+
+    assert bpreshuffle, "FlyDSL hgemm requires bpreshuffle=True."
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "FlyDSL hgemm does not support scaling yet."
+    out = flydsl_hgemm(
+        inp,
+        weights,
+        tile_k=int(tile_k),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        pack_n=int(pack_n),
+        split_k=int(split_k),
+        b_preshuffle=True,
+    )
+    if bias is not None:
+        out = out if otype is None else out.to(otype)
+        out = out + bias
+    return out
 
 
 def triton_gemm(

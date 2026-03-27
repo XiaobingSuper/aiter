@@ -267,16 +267,8 @@ def flydsl_ldg_reg_counts(tile_m, tile_n, tile_k):
     return ldg_reg_a_count, ldg_reg_b_count
 
 
-def is_flydsl_tail_m(m, tile_m):
-    return int(m) < int(tile_m) or int(m) % int(tile_m) != 0
-
-
 def get_flydsl_bench_kwargs(m, tile_m, num_warmup):
-    if is_flydsl_tail_m(m, tile_m):
-        return {
-            "num_warmup": min(int(num_warmup), 1),
-            "num_iters": 3,
-        }
+    del m, tile_m
     return {
         "num_warmup": num_warmup,
         "num_iters": 101,
