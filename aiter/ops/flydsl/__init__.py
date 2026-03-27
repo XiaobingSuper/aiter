@@ -38,8 +38,16 @@ if is_flydsl_available():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
+    from .gemm_kernels import (
+        compile_flydsl_hgemm,
+        flydsl_hgemm,
+        flydsl_hgemm_shuffle_b,
+    )
 
     __all__ += [
+        "compile_flydsl_hgemm",
+        "flydsl_hgemm",
+        "flydsl_hgemm_shuffle_b",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
     ]

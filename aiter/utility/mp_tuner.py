@@ -471,6 +471,11 @@ def mp_tuner(
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     failed_tasks.append((k, "timeout"))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
 
                 # Only log error once per error type
@@ -529,6 +534,10 @@ def mp_tuner(
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
+        if not task_result:
+            dummy_results = []
+            add_dummy_result(k, dummy_results)
+            task_result = dummy_results if shape_grouped else [dummy_results[0]]
         if shape_grouped:
             result.extend(task_result)
         else:

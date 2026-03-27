@@ -77,6 +77,30 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
+def run_flydsl_gemm_bf16(
+    inp,
+    weight,
+    out,
+    tile_k,
+    tile_m,
+    tile_n,
+    pack=1,
+    splitK=1,
+):
+    flydsl_hgemm, _ = get_flydsl_gemm_ops()
+    return flydsl_hgemm(
+        inp,
+        weight,
+        out=out,
+        tile_k=tile_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        pack_n=pack,
+        split_k=splitK,
+        b_preshuffle=True,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -130,6 +154,45 @@ def generate_data(
     return (inp, weights, weights.t(), bias, x_scale, out_asm, shuffleweights, w_scale)
 
 
+def generate_data_flydsl(
+    m,
+    n,
+    k,
+    indtype,
+    outdtype,
+    scaleAB,
+    seed=0,
+    bias=False,
+    pack=1,
+    device="cuda:0",
+):
+    (
+        inp,
+        weights,
+        weights_t,
+        bias_tensor,
+        x_scale,
+        out,
+        _,
+        w_scale,
+    ) = generate_data(
+        m,
+        n,
+        k,
+        indtype,
+        outdtype,
+        scaleAB,
+        False,
+        seed,
+        bias,
+        device,
+    )
+    _, flydsl_hgemm_shuffle_b = get_flydsl_gemm_ops()
+    # FlyDSL HGEMM uses its own preshuffle layout instead of CK shuffle_weight().
+    flydsl_weights = flydsl_hgemm_shuffle_b(weights, pack_n=pack)
+    return (inp, weights, weights_t, bias_tensor, x_scale, out, flydsl_weights, w_scale)
+
+
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
     scaleA = scaleA
     scaleB = scaleB
@@ -172,6 +235,75 @@ rtol = 1e-5
 atol = 1
 
 CACHE_INVALIDATE_BUFFERS = int(os.getenv("CACHE_INVALIDATE_BUFFERS", "37"))
+
+GEMM_TUNING_META_DEFAULTS = {
+    "tile_k": -1,
+    "tile_m": -1,
+    "tile_n": -1,
+    "pack": -1,
+}
+
+FLYDSL_TILE_KS = (64, 128)
+FLYDSL_TILE_MS = (16, 32, 48, 64, 96, 128)
+FLYDSL_TILE_NS = (64, 128, 256)
+FLYDSL_PACKS = (1,)
+FLYDSL_SPLITKS = (1,)
+
+
+def make_tuning_meta(tile_k=-1, tile_m=-1, tile_n=-1, pack=-1):
+    return {
+        "tile_k": int(tile_k),
+        "tile_m": int(tile_m),
+        "tile_n": int(tile_n),
+        "pack": int(pack),
+    }
+
+
+def flydsl_ldg_reg_counts(tile_m, tile_n, tile_k):
+    block_threads = 4 * 64
+    ldg_vec_size = 8
+    ldg_reg_a_count = (int(tile_m) * int(tile_k)) // ldg_vec_size // block_threads
+    ldg_reg_b_count = (int(tile_n) * int(tile_k)) // ldg_vec_size // block_threads
+    return ldg_reg_a_count, ldg_reg_b_count
+
+
+def is_flydsl_tail_m(m, tile_m):
+    return int(m) < int(tile_m) or int(m) % int(tile_m) != 0
+
+
+def get_flydsl_bench_kwargs(m, tile_m, num_warmup):
+    if is_flydsl_tail_m(m, tile_m):
+        return {
+            "num_warmup": min(int(num_warmup), 1),
+            "num_iters": 3,
+        }
+    return {
+        "num_warmup": num_warmup,
+        "num_iters": 101,
+    }
+
+
+@lru_cache(maxsize=1)
+def get_flydsl_gemm_ops():
+    from aiter.ops.flydsl import flydsl_hgemm, flydsl_hgemm_shuffle_b
+
+    return flydsl_hgemm, flydsl_hgemm_shuffle_b
+
+
+def get_flydsl_dtype_tag(dtype):
+    if dtype == dtypes.bf16:
+        return "bf16"
+    if dtype == dtypes.fp16:
+        return "f16"
+    return str(dtype).replace("torch.", "")
+
+
+def get_flydsl_kernel_name(dtype, tile_m, tile_n, tile_k, pack, splitK):
+    dtype_tag = get_flydsl_dtype_tag(dtype)
+    kernel_name = f"hgemm_{dtype_tag}_{tile_m}x{tile_n}x{tile_k}_S2TN_BP"
+    if splitK > 1:
+        kernel_name += f"_SPK{splitK}"
+    return kernel_name
 
 
 class Gemm:
@@ -358,6 +490,8 @@ class Gemm:
             print(
                 f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}, splitK: {splitK}, subK: {subK}, bias:{bias}"
             )
+            if self.n % tile_n != 0:
+                continue
             kernelName = asm_kernels[key][0]
             start = 1
             if splitK:
@@ -378,6 +512,11 @@ class Gemm:
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(start, maxSplitK + 1):
+                if splitK > 1:
+                    gdx = (self.n + tile_n - 1) // tile_n
+                    gdy = (self.m + tile_m - 1) // tile_m
+                    if gdx * gdy > 1024:
+                        continue
                 info = (
                     (
                         self.m,
@@ -393,6 +532,7 @@ class Gemm:
                     splitK,
                     "asm",
                     kernelName,
+                    make_tuning_meta(tile_k=256, tile_m=tile_m, tile_n=tile_n, pack=1),
                 )
                 if self.k / splitK < subK:
                     break
@@ -430,12 +570,112 @@ class Gemm:
         # ret = mp_tuner(task_asm, in_data, self.mp, False)
         return task_asm
 
+    def flydsl_gemm_all_sols(self):
+        if not self.is_shuffle:
+            logger.warning("FlyDSL gemm only supports bpreshuffle=True")
+            return []
+        if self.has_bias:
+            logger.warning("FlyDSL gemm does not support bias yet")
+            return []
+        if self.scaleAB:
+            logger.warning("FlyDSL gemm does not support scaleAB yet")
+            return []
+        if self.indtype not in [dtypes.bf16, dtypes.fp16]:
+            logger.warning(
+                f"FlyDSL gemm only supports bf16/fp16 input, but actual indtype is {self.indtype}"
+            )
+            return []
+        if self.outdtype != self.indtype:
+            logger.warning(
+                "FlyDSL gemm currently requires outdtype == indtype, "
+                f"but got indtype={self.indtype}, outdtype={self.outdtype}"
+            )
+            return []
+
+        try:
+            get_flydsl_gemm_ops()
+        except Exception as exc:
+            logger.warning(f"FlyDSL gemm is unavailable and will be skipped: {exc}")
+            return []
+
+        task_flydsl = []
+        solidx = 0
+        for tile_k in FLYDSL_TILE_KS:
+            if self.k % tile_k != 0:
+                continue
+            for tile_m in FLYDSL_TILE_MS:
+                for tile_n in FLYDSL_TILE_NS:
+                    if self.n < tile_n or self.n % tile_n != 0:
+                        continue
+                    ldg_reg_a_count, ldg_reg_b_count = flydsl_ldg_reg_counts(
+                        tile_m, tile_n, tile_k
+                    )
+                    if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
+                        continue
+                    for pack in FLYDSL_PACKS:
+                        for splitK in FLYDSL_SPLITKS:
+                            solidx += 1
+                            kernelName = get_flydsl_kernel_name(
+                                self.indtype, tile_m, tile_n, tile_k, pack, splitK
+                            )
+                            info = (
+                                (
+                                    self.m,
+                                    self.n,
+                                    self.k,
+                                    self.has_bias,
+                                    str(self.indtype),
+                                    str(self.outdtype),
+                                    self.scaleAB,
+                                    self.is_shuffle,
+                                ),
+                                solidx,
+                                splitK,
+                                "flydsl",
+                                kernelName,
+                                make_tuning_meta(
+                                    tile_k=tile_k,
+                                    tile_m=tile_m,
+                                    tile_n=tile_n,
+                                    pack=pack,
+                                ),
+                            )
+                            task_flydsl.append(
+                                (
+                                    info,
+                                    generate_data_flydsl,
+                                    (
+                                        self.m,
+                                        self.n,
+                                        self.k,
+                                        self.indtype,
+                                        self.outdtype,
+                                        self.scaleAB,
+                                        0,
+                                        self.has_bias,
+                                        pack,
+                                    ),
+                                    run_flydsl_gemm_bf16,
+                                    ([0, 6, 5], tile_k, tile_m, tile_n, pack, splitK),
+                                    get_flydsl_bench_kwargs(self.m, tile_m, self.num_warmup),
+                                    get_gemm_ref,
+                                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                                    {},
+                                    None,
+                                    self.rtol,
+                                    self.atol,
+                                )
+                            )
+        return task_flydsl
+
     def run_asm_triton_sols(self):
         tasks = []
         if "all" in self.libtype or "triton" in self.libtype:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
             tasks.extend(self.asm_gemm_all_solutions())
+        if "all" in self.libtype or "flydsl" in self.libtype:
+            tasks.extend(self.flydsl_gemm_all_sols())
         solutions = len(tasks)
         in_data = [
             (
@@ -474,6 +714,7 @@ class Gemm:
             0,
             "triton",
             "auto",
+            make_tuning_meta(),
         )
         task = []
         task.append(
@@ -536,6 +777,7 @@ class Gemm:
                 0,  # splitK
                 "hipblaslt",
                 "",
+                make_tuning_meta(),
             )
             task.append(
                 (
@@ -662,7 +904,7 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton"]:
+        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -720,7 +962,7 @@ class GemmTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl']",
         )
 
     def __init__(
@@ -739,6 +981,10 @@ class GemmTuner(GemmCommonTuner):
         resultList=[
             "libtype",
             "solidx",
+            "tile_k",
+            "tile_m",
+            "tile_n",
+            "pack",
             "splitK",
             "us",
             "kernelName",
@@ -759,6 +1005,16 @@ class GemmTuner(GemmCommonTuner):
         self.cu_num = self.get_cu_num()
         self.gemmobj = None
         self.num_warmup = 10
+
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+        tunedf = super().get_tuned_gemm_list(tuned_gemm_file, columns)
+        for col, default in GEMM_TUNING_META_DEFAULTS.items():
+            if col not in tunedf.columns:
+                tunedf[col] = default
+        for col in self.columns:
+            if col not in tunedf.columns:
+                tunedf[col] = ""
+        return tunedf[self.columns]
 
     def calculate_perf(
         self,
@@ -923,12 +1179,17 @@ class GemmTuner(GemmCommonTuner):
             splitK = info[2]
             kernelName = info[4]
             libtype = info[3]
+            tuning_meta = info[5] if len(info) > 5 else make_tuning_meta()
             res_one.append(get_cu_num())
             for ele in info[0]:
                 res_one.append(ele)
 
             res_one.append(libtype)
             res_one.append(int(solidx))
+            res_one.append(int(tuning_meta.get("tile_k", -1)))
+            res_one.append(int(tuning_meta.get("tile_m", -1)))
+            res_one.append(int(tuning_meta.get("tile_n", -1)))
+            res_one.append(int(tuning_meta.get("pack", -1)))
             res_one.append(int(splitK))
             res_one.append(round(us, 4))
 
@@ -981,16 +1242,13 @@ class GemmTuner(GemmCommonTuner):
             best_gtimedf = gtimedf_dic[key].sort_values(by="us")
 
             if len(gtimedf_dic[key]) == 0:
-                print(">>> No  hipblas or asm solutions found!", flush=True)
+                print(">>> No valid solutions found!", flush=True)
                 failedf = df.iloc[0:1]
                 self.failed = pd.concat([self.failed, failedf], ignore_index=True)
                 continue
-            asm_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "asm"]
-            hibs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "hipblaslt"]
-            if len(hibs_gtimedf) == 0:
-                print(">>>Only asm solutions found!", flush=True)
-            elif len(asm_gtimedf) == 0:
-                print(">>>Only hipblas solutions found!", flush=True)
+            found_libtypes = sorted(gtimedf_dic[key]["libtype"].unique().tolist())
+            if len(found_libtypes) == 1:
+                print(f">>>Only {found_libtypes[0]} solutions found!", flush=True)
             resultdf1 = best_gtimedf.head(1).reset_index(drop=True)
             kernal_name = (
                 aiter.getHipblasltKernelName(int(resultdf1.iloc[0]["solidx"]))
