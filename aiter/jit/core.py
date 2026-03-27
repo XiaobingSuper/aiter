@@ -262,11 +262,34 @@ class AITER_CONFIG(object):
 
         if not config_env_file:
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            op_tuned_file_list = [
-                p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
-            ]
+            import pandas as pd
+
+            base_cols = None
+            if os.path.exists(default_file):
+                base_cols = [
+                    c for c in pd.read_csv(default_file, nrows=0).columns if c != "_tag"
+                ]
+
+            op_tuned_file_list = []
+            for p in sorted(model_config_dir.glob(f"*{tuned_file_name}*")):
+                if not (p.is_file() and "untuned" not in str(p)):
+                    continue
+                if base_cols is not None:
+                    try:
+                        new_cols = [
+                            c for c in pd.read_csv(p, nrows=0).columns if c != "_tag"
+                        ]
+                    except Exception as exc:
+                        logger.warning(
+                            f"Skipping tuned file {p}: failed to read columns ({exc})"
+                        )
+                        continue
+                    if base_cols != new_cols:
+                        logger.info(
+                            f"skip tuned file {p} due to column mismatch with {default_file}"
+                        )
+                        continue
+                op_tuned_file_list.append(p)
 
             if not op_tuned_file_list:
                 config_file = default_file
