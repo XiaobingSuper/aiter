@@ -83,6 +83,14 @@ def get_GEMM_A16W16_flydsl_tuned_files_():
                         )
                     )
                 )
+        model_config_dir = Path(this_dir) / "configs" / "model_configs"
+        tuned_files.extend(
+            str(path)
+            for path in sorted(
+                model_config_dir.glob("*_flydsl_bshuffle_bf16_tuned_gemm.csv")
+            )
+            if path.is_file() and "untuned" not in str(path)
+        )
     dedup_files = []
     for tuned_file in tuned_files:
         if tuned_file not in dedup_files and os.path.exists(tuned_file):
@@ -370,6 +378,7 @@ def gemm_a16w16(
             tile_m=config["tile_m"],
             tile_n=config["tile_n"],
             pack_n=config.get("pack", 1),
+            stages=config.get("stages", 2),
             split_k=config["splitK"],
             bpreshuffle=bpreshuffle,
         )
@@ -529,6 +538,7 @@ def flydsl_gemm(
     tile_m: int,
     tile_n: int,
     pack_n: int = 1,
+    stages: int = 2,
     split_k: int = 1,
     bpreshuffle: bool = False,
 ):
@@ -545,6 +555,7 @@ def flydsl_gemm(
         tile_m=int(tile_m),
         tile_n=int(tile_n),
         pack_n=int(pack_n),
+        stages=int(stages),
         split_k=int(split_k),
         b_preshuffle=True,
     )

@@ -274,6 +274,9 @@ class AITER_CONFIG(object):
             for p in sorted(model_config_dir.glob(f"*{tuned_file_name}*")):
                 if not (p.is_file() and "untuned" not in str(p)):
                     continue
+                # FlyDSL bshuffle configs are loaded separately by tuned_gemm.py.
+                if tuned_file_name == "bf16_tuned_gemm" and "_flydsl_bshuffle_" in p.name:
+                    continue
                 if base_cols is not None:
                     try:
                         new_cols = [
