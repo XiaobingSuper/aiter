@@ -10,6 +10,7 @@ import argparse
 import pytest
 import torch
 
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import run_perftest
 
@@ -19,7 +20,7 @@ if not is_flydsl_available():
     pytest.skip("flydsl is not installed. Skipping FlyDSL HGEMM tests.", allow_module_level=True)
 
 try:
-    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm, flydsl_hgemm_shuffle_b
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 except ImportError as exc:
     pytest.skip(f"Unable to import FlyDSL HGEMM kernels: {exc}", allow_module_level=True)
 
@@ -105,7 +106,7 @@ def test_flydsl_preshuffle_splitk_hgemm(
     torch.cuda.synchronize()
     ref = run_torch_acc(a, b, dtype=torch.float32)
 
-    b_shuf = flydsl_hgemm_shuffle_b(b, pack_n=pack_n)
+    b_shuf = shuffle_weight(b, layout=(16 * pack_n, 16))
     out = torch.empty((m, n), device="cuda", dtype=torch_dtype)
     _, us = run_perftest(
         flydsl_hgemm,

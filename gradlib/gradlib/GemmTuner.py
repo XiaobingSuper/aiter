@@ -84,10 +84,11 @@ def run_flydsl_gemm_bf16(
     tile_k,
     tile_m,
     tile_n,
+    stages=2,
     pack=1,
     splitK=1,
 ):
-    flydsl_hgemm, _ = get_flydsl_gemm_ops()
+    flydsl_hgemm = get_flydsl_gemm_ops()
     return flydsl_hgemm(
         inp,
         weight,
@@ -95,6 +96,7 @@ def run_flydsl_gemm_bf16(
         tile_k=tile_k,
         tile_m=tile_m,
         tile_n=tile_n,
+        stages=stages,
         pack_n=pack,
         split_k=splitK,
         b_preshuffle=True,
@@ -187,9 +189,7 @@ def generate_data_flydsl(
         bias,
         device,
     )
-    _, flydsl_hgemm_shuffle_b = get_flydsl_gemm_ops()
-    # FlyDSL HGEMM uses its own preshuffle layout instead of CK shuffle_weight().
-    flydsl_weights = flydsl_hgemm_shuffle_b(weights, pack_n=pack)
+    flydsl_weights = shuffle_weight(weights, layout=(16 * pack, 16))
     return (inp, weights, weights_t, bias_tensor, x_scale, out, flydsl_weights, w_scale)
 
 
@@ -241,21 +241,24 @@ GEMM_TUNING_META_DEFAULTS = {
     "tile_m": -1,
     "tile_n": -1,
     "pack": -1,
+    "stages": -1,
 }
 
 FLYDSL_TILE_KS = (64, 128)
 FLYDSL_TILE_MS = (16, 32, 48, 64, 96, 128)
 FLYDSL_TILE_NS = (64, 128, 256)
 FLYDSL_PACKS = (1,)
-FLYDSL_SPLITKS = (1,)
+FLYDSL_SPLITKS = (1, 2, 4)
+FLYDSL_STAGES = (1, 2)
 
 
-def make_tuning_meta(tile_k=-1, tile_m=-1, tile_n=-1, pack=-1):
+def make_tuning_meta(tile_k=-1, tile_m=-1, tile_n=-1, pack=-1, stages=-1):
     return {
         "tile_k": int(tile_k),
         "tile_m": int(tile_m),
         "tile_n": int(tile_n),
         "pack": int(pack),
+        "stages": int(stages),
     }
 
 
@@ -264,7 +267,31 @@ def flydsl_ldg_reg_counts(tile_m, tile_n, tile_k):
     ldg_vec_size = 8
     ldg_reg_a_count = (int(tile_m) * int(tile_k)) // ldg_vec_size // block_threads
     ldg_reg_b_count = (int(tile_n) * int(tile_k)) // ldg_vec_size // block_threads
-    return ldg_reg_a_count, ldg_reg_b_count
+    ldg_reg_c_count = (int(tile_m) * int(tile_n)) // ldg_vec_size // block_threads
+    return ldg_reg_a_count, ldg_reg_b_count, ldg_reg_c_count
+
+
+def is_valid_flydsl_tiling(m, n, k, tile_m, tile_n, tile_k, pack, splitK, stages):
+    del m
+    if pack != 1 or stages not in (1, 2):
+        return False
+    if tile_k < 32:
+        return False
+    if n < tile_n or n % tile_n != 0:
+        return False
+    if splitK < 1 or k % splitK != 0:
+        return False
+    ks = k // splitK
+    if ks < tile_k or ks % tile_k != 0:
+        return False
+    ldg_reg_a_count, ldg_reg_b_count, ldg_reg_c_count = flydsl_ldg_reg_counts(
+        tile_m, tile_n, tile_k
+    )
+    if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
+        return False
+    if splitK > 1 and ldg_reg_c_count < 1:
+        return False
+    return True
 
 
 def get_flydsl_bench_kwargs(m, tile_m, num_warmup):
@@ -277,9 +304,9 @@ def get_flydsl_bench_kwargs(m, tile_m, num_warmup):
 
 @lru_cache(maxsize=1)
 def get_flydsl_gemm_ops():
-    from aiter.ops.flydsl import flydsl_hgemm, flydsl_hgemm_shuffle_b
+    from aiter.ops.flydsl import flydsl_hgemm
 
-    return flydsl_hgemm, flydsl_hgemm_shuffle_b
+    return flydsl_hgemm
 
 
 def get_flydsl_dtype_tag(dtype):
@@ -290,9 +317,10 @@ def get_flydsl_dtype_tag(dtype):
     return str(dtype).replace("torch.", "")
 
 
-def get_flydsl_kernel_name(dtype, tile_m, tile_n, tile_k, pack, splitK):
+def get_flydsl_kernel_name(dtype, tile_m, tile_n, tile_k, stages, pack, splitK):
+    del pack
     dtype_tag = get_flydsl_dtype_tag(dtype)
-    kernel_name = f"hgemm_{dtype_tag}_{tile_m}x{tile_n}x{tile_k}_S2TN_BP"
+    kernel_name = f"hgemm_{dtype_tag}_{tile_m}x{tile_n}x{tile_k}_S{stages}TN_BP"
     if splitK > 1:
         kernel_name += f"_SPK{splitK}"
     return kernel_name
@@ -593,71 +621,82 @@ class Gemm:
         task_flydsl = []
         solidx = 0
         for tile_k in FLYDSL_TILE_KS:
-            if self.k % tile_k != 0:
-                continue
             for tile_m in FLYDSL_TILE_MS:
                 for tile_n in FLYDSL_TILE_NS:
-                    if self.n < tile_n or self.n % tile_n != 0:
-                        continue
-                    ldg_reg_a_count, ldg_reg_b_count = flydsl_ldg_reg_counts(
-                        tile_m, tile_n, tile_k
-                    )
-                    if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
-                        continue
-                    for pack in FLYDSL_PACKS:
-                        for splitK in FLYDSL_SPLITKS:
-                            solidx += 1
-                            kernelName = get_flydsl_kernel_name(
-                                self.indtype, tile_m, tile_n, tile_k, pack, splitK
-                            )
-                            info = (
-                                (
+                    for stages in FLYDSL_STAGES:
+                        for pack in FLYDSL_PACKS:
+                            for splitK in FLYDSL_SPLITKS:
+                                if not is_valid_flydsl_tiling(
                                     self.m,
                                     self.n,
                                     self.k,
-                                    self.has_bias,
-                                    str(self.indtype),
-                                    str(self.outdtype),
-                                    self.scaleAB,
-                                    self.is_shuffle,
-                                ),
-                                solidx,
-                                splitK,
-                                "flydsl",
-                                kernelName,
-                                make_tuning_meta(
-                                    tile_k=tile_k,
-                                    tile_m=tile_m,
-                                    tile_n=tile_n,
-                                    pack=pack,
-                                ),
-                            )
-                            task_flydsl.append(
-                                (
-                                    info,
-                                    generate_data_flydsl,
+                                    tile_m,
+                                    tile_n,
+                                    tile_k,
+                                    pack,
+                                    splitK,
+                                    stages,
+                                ):
+                                    continue
+                                solidx += 1
+                                kernelName = get_flydsl_kernel_name(
+                                    self.indtype,
+                                    tile_m,
+                                    tile_n,
+                                    tile_k,
+                                    stages,
+                                    pack,
+                                    splitK,
+                                )
+                                info = (
                                     (
                                         self.m,
                                         self.n,
                                         self.k,
-                                        self.indtype,
-                                        self.outdtype,
-                                        self.scaleAB,
-                                        0,
                                         self.has_bias,
-                                        pack,
+                                        str(self.indtype),
+                                        str(self.outdtype),
+                                        self.scaleAB,
+                                        self.is_shuffle,
                                     ),
-                                    run_flydsl_gemm_bf16,
-                                    ([0, 6, 5], tile_k, tile_m, tile_n, pack, splitK),
-                                    get_flydsl_bench_kwargs(self.m, tile_m, self.num_warmup),
-                                    get_gemm_ref,
-                                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
-                                    {},
-                                    None,
-                                    self.rtol,
-                                    self.atol,
+                                    solidx,
+                                    splitK,
+                                    "flydsl",
+                                    kernelName,
+                                    make_tuning_meta(
+                                        tile_k=tile_k,
+                                        tile_m=tile_m,
+                                        tile_n=tile_n,
+                                        pack=pack,
+                                        stages=stages,
+                                    ),
                                 )
-                            )
+                                task_flydsl.append(
+                                    (
+                                        info,
+                                        generate_data_flydsl,
+                                        (
+                                            self.m,
+                                            self.n,
+                                            self.k,
+                                            self.indtype,
+                                            self.outdtype,
+                                            self.scaleAB,
+                                            0,
+                                            self.has_bias,
+                                            pack,
+                                        ),
+                                        run_flydsl_gemm_bf16,
+                                        ([0, 6, 5], tile_k, tile_m, tile_n, stages, pack, splitK),
+                                        get_flydsl_bench_kwargs(self.m, tile_m, self.num_warmup),
+                                        get_gemm_ref,
+                                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                                        {},
+                                        None,
+                                        self.rtol,
+                                        self.atol,
+                                    )
+                                )
         return task_flydsl
 
     def run_asm_triton_sols(self):
@@ -977,6 +1016,7 @@ class GemmTuner(GemmCommonTuner):
             "tile_m",
             "tile_n",
             "pack",
+            "stages",
             "splitK",
             "us",
             "kernelName",
@@ -1182,6 +1222,7 @@ class GemmTuner(GemmCommonTuner):
             res_one.append(int(tuning_meta.get("tile_m", -1)))
             res_one.append(int(tuning_meta.get("tile_n", -1)))
             res_one.append(int(tuning_meta.get("pack", -1)))
+            res_one.append(int(tuning_meta.get("stages", -1)))
             res_one.append(int(splitK))
             res_one.append(round(us, 4))
 

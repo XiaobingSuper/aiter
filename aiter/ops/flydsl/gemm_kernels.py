@@ -9,16 +9,16 @@ from typing import Optional
 
 import torch
 
-from .kernels.preshuffle_splitk_hgemm import (
-    compile_hgemm_kernel,
-    hgemm_spk_shuffle_b,
-)
+from ..shuffle import shuffle_weight
+from .kernels.preshuffle_splitk_hgemm import compile_hgemm_kernel
 
 __all__ = [
     "compile_flydsl_hgemm",
     "flydsl_hgemm",
-    "flydsl_hgemm_shuffle_b",
 ]
+
+SPLIT_K_COUNTER_MAX_LEN = 128
+SPLIT_K_GLOBAL_SEMAPHORE: dict[torch.device, torch.Tensor] = {}
 
 
 def _to_kernel_dtype(dtype: torch.dtype) -> str:
@@ -27,6 +27,10 @@ def _to_kernel_dtype(dtype: torch.dtype) -> str:
     if dtype == torch.bfloat16:
         return "bf16"
     raise ValueError(f"Only fp16/bf16 are supported, got {dtype!r}")
+
+
+def _get_flydsl_shuffle_layout(pack_n: int) -> tuple[int, int]:
+    return (16 * pack_n, 16)
 
 
 def _validate_hgemm_inputs(
@@ -79,15 +83,27 @@ def _validate_hgemm_tiling(
     tile_k: int,
     pack_n: int,
     split_k: int,
+    stages: int,
     block_m_warps: int,
     block_n_warps: int,
 ) -> None:
     del m
 
+    if tile_k < 32:
+        raise ValueError(f"Invalid tile_k={tile_k}; latest kernel requires tile_k >= 32")
+    if split_k < 1:
+        raise ValueError(f"Invalid split_k={split_k}; split_k must be >= 1")
+    if stages not in (1, 2):
+        raise ValueError(f"Invalid stages={stages}; latest kernel only supports stages in {{1, 2}}")
     if pack_n != 1:
         raise ValueError(
             "Latest `hgemm.py` kernel only supports `pack_n=1`; "
             f"got pack_n={pack_n}"
+        )
+    if block_m_warps * block_n_warps != 4:
+        raise ValueError(
+            "Latest `hgemm.py` kernel requires block_m_warps * block_n_warps == 4; "
+            f"got {block_m_warps} * {block_n_warps}"
         )
 
     warp_atom_m = 16
@@ -124,10 +140,41 @@ def _validate_hgemm_tiling(
     ldg_vec_size = 8
     ldg_reg_a_count = (tile_m * tile_k) // ldg_vec_size // block_threads
     ldg_reg_b_count = (tile_n * tile_k) // ldg_vec_size // block_threads
+    ldg_reg_c_count = (tile_m * tile_n) // ldg_vec_size // block_threads
     if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
         raise ValueError(
             "Invalid tile combination: requires at least one vectorized global load per thread "
             f"(got ldg_reg_a_count={ldg_reg_a_count}, ldg_reg_b_count={ldg_reg_b_count})"
+        )
+    if split_k > 1 and ldg_reg_c_count < 1:
+        raise ValueError(
+            "Invalid split-K tile combination: requires at least one vectorized C load/store per thread "
+            f"(got ldg_reg_c_count={ldg_reg_c_count})"
+        )
+
+
+def _get_split_k_global_semaphore(device: torch.device) -> torch.Tensor:
+    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(device)
+    if semaphore is None:
+        semaphore = torch.zeros(
+            (SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device
+        )
+        SPLIT_K_GLOBAL_SEMAPHORE[device] = semaphore
+    return semaphore
+
+
+def _check_split_k_counter_capacity(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> None:
+    if split_k <= 1:
+        return
+    bm = (m + tile_m - 1) // tile_m
+    bn = n // tile_n
+    required = bm * bn
+    if required > SPLIT_K_COUNTER_MAX_LEN:
+        raise ValueError(
+            "Split-K counter capacity exceeded: "
+            f"requires {required} counters, max supported is {SPLIT_K_COUNTER_MAX_LEN}"
         )
 
 
@@ -154,6 +201,8 @@ def compile_flydsl_hgemm(
 
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
+    if b_preshuffle and b_to_lds:
+        raise ValueError("Latest `hgemm.py` requires b_to_lds=False when b_preshuffle=True")
 
     _validate_hgemm_tiling(
         m,
@@ -164,13 +213,13 @@ def compile_flydsl_hgemm(
         tile_k=tile_k,
         pack_n=pack_n,
         split_k=split_k,
+        stages=stages,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
     )
 
-    return compile_hgemm_kernel(
+    kernel = compile_hgemm_kernel(
         dtype,
-        m,
         n,
         k,
         TILE_K=tile_k,
@@ -186,27 +235,21 @@ def compile_flydsl_hgemm(
         C_TO_LDS=c_to_lds,
     )
 
+    def launcher(
+        out: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        stream=None,
+    ):
+        runtime_m = int(a.shape[0])
+        _check_split_k_counter_capacity(runtime_m, n, tile_m, tile_n, split_k)
+        semaphore = _get_split_k_global_semaphore(a.device)
+        launch_stream = (
+            torch.cuda.current_stream(device=a.device) if stream is None else stream
+        )
+        return kernel(out, a, b, runtime_m, semaphore, stream=launch_stream)
 
-def flydsl_hgemm_shuffle_b(
-    weight: torch.Tensor,
-    *,
-    layout: tuple[int, int] = (16, 16),
-    pack_n: int = 1,
-    k_steps: int = 2,
-) -> torch.Tensor:
-    """Convert `(N, K)` weight to the preshuffled layout expected by the kernel."""
-
-    if weight.dim() != 2:
-        raise ValueError(f"`weight` must be 2D, got {weight.dim()}D")
-    if weight.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"Only fp16/bf16 are supported, got {weight.dtype!r}")
-    return hgemm_spk_shuffle_b(
-        weight.contiguous(),
-        layout=layout,
-        pack_n=pack_n,
-        k_steps=k_steps,
-    )
-
+    return launcher
 
 def flydsl_hgemm(
     a: torch.Tensor,
@@ -230,7 +273,7 @@ def flydsl_hgemm(
     """Run FlyDSL HGEMM.
 
     `a` is `(M, K)`.
-    `b` is `(N, K)`, optionally pre-shuffled via `flydsl_hgemm_shuffle_b()`.
+    `b` is `(N, K)`, optionally pre-shuffled via `shuffle_weight()`.
     Returns `(M, N)`.
     """
 
@@ -244,11 +287,12 @@ def flydsl_hgemm(
 
     if b_preshuffle and not getattr(b, "is_shuffled", False):
         if auto_shuffle_b:
-            b = flydsl_hgemm_shuffle_b(b, pack_n=pack_n)
+            b = shuffle_weight(b, layout=_get_flydsl_shuffle_layout(pack_n))
         else:
             raise ValueError(
                 "`b_preshuffle=True` expects `b` to be pre-shuffled. "
-                "Use `flydsl_hgemm_shuffle_b()` first or pass `auto_shuffle_b=True`."
+                f"Use `shuffle_weight(b, layout={_get_flydsl_shuffle_layout(pack_n)})` "
+                "first or pass `auto_shuffle_b=True`."
             )
 
     if out is None:
@@ -272,9 +316,6 @@ def flydsl_hgemm(
         split_k=split_k,
         c_to_lds=c_to_lds,
     )
-
-    if split_k > 1:
-        out.zero_()
 
     launcher(out, a, b)
     return out

@@ -308,6 +308,19 @@ def save_shapes(
         tuned_df.to_csv(untune_path, index=False)
 
 
+def _get_config_int(config: dict, key: str, default: int) -> int:
+    value = config.get(key, default)
+    if value is None or value == "":
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    value = int(value)
+    return default if value < 0 else value
+
+
 def gen_gemm_a16w16_fake_tensor(
     A: Tensor,
     B: Tensor,
@@ -377,9 +390,9 @@ def gemm_a16w16(
             tile_k=config["tile_k"],
             tile_m=config["tile_m"],
             tile_n=config["tile_n"],
-            pack_n=config.get("pack", 1),
-            stages=config.get("stages", 2),
-            split_k=config["splitK"],
+            pack_n=_get_config_int(config, "pack", 1),
+            stages=_get_config_int(config, "stages", 2),
+            split_k=_get_config_int(config, "splitK", 1),
             bpreshuffle=bpreshuffle,
         )
     else:
