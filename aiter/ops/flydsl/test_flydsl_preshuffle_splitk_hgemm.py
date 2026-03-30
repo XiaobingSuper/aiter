@@ -42,8 +42,8 @@ def _check_output(
     ref: torch.Tensor,
     out: torch.Tensor,
     *,
-    atol: float = 0.1,
-    rtol: float = 0.1,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
     pass_pct: float = 95.0,
 ) -> bool:
     close_mask = torch.isclose(ref, out, atol=atol, rtol=rtol)
@@ -54,6 +54,13 @@ def _check_output(
 
 
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "b_preshuffle",
+    [
+        pytest.param(False, id="raw-b"),
+        pytest.param(True, id="preshuffled-b"),
+    ],
+)
 @pytest.mark.parametrize(
     "m, n, k, tile_k, tile_m, tile_n, pack_n, split_k",
     [
@@ -69,8 +76,9 @@ def _check_output(
         pytest.param(True, id="graph"),
     ],
 )
-def test_flydsl_preshuffle_splitk_hgemm(
+def test_flydsl_splitk_hgemm(
     dtype: str,
+    b_preshuffle: bool,
     m: int,
     n: int,
     k: int,
@@ -79,21 +87,23 @@ def test_flydsl_preshuffle_splitk_hgemm(
     tile_n: int,
     pack_n: int,
     split_k: int,
-    *,
     test_graph: bool,
     bench_iters: int = DEFAULT_BENCH_ITERS,
     bench_warmup: int = DEFAULT_BENCH_WARMUP,
 ):
     print("=" * 80)
-    print(f"[flydsl] preshuffle split-K HGEMM dtype={dtype} shape=({m}, {n}, {k})")
+    print(
+        "[flydsl] preshuffle split-K HGEMM "
+        f"dtype={dtype} b_preshuffle={b_preshuffle} shape=({m}, {n}, {k})"
+    )
     print("=" * 80)
 
     torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
     if m < tile_m or m % tile_m != 0:
         bench_warmup = min(bench_warmup, 1)
         bench_iters = min(bench_iters, 3)
-    a = torch.rand((m, k), device="cuda", dtype=torch.float32).to(torch_dtype)
-    b = torch.rand((n, k), device="cuda", dtype=torch.float32).to(torch_dtype)
+    a = torch.rand((m, k), device="cuda", dtype=torch_dtype)
+    b = torch.rand((n, k), device="cuda", dtype=torch_dtype)
 
     _, ref_us = run_perftest(
         run_torch_bench,
@@ -104,9 +114,12 @@ def test_flydsl_preshuffle_splitk_hgemm(
         testGraph=test_graph,
     )
     torch.cuda.synchronize()
-    ref = run_torch_acc(a, b, dtype=torch.float32)
+    ref = run_torch_bench(a, b)
 
-    b_shuf = shuffle_weight(b, layout=(16 * pack_n, 16))
+    if b_preshuffle:
+        b_shuf = shuffle_weight(b, layout=(16 * pack_n, 16))
+    else:
+        b_shuf = b
     out = torch.empty((m, n), device="cuda", dtype=torch_dtype)
     _, us = run_perftest(
         flydsl_hgemm,
@@ -121,7 +134,7 @@ def test_flydsl_preshuffle_splitk_hgemm(
         tile_n=tile_n,
         pack_n=pack_n,
         split_k=split_k,
-        b_preshuffle=True,
+        b_preshuffle=b_preshuffle,
     )
     torch.cuda.synchronize()
 
@@ -134,8 +147,8 @@ def test_flydsl_preshuffle_splitk_hgemm(
         tile_n=tile_n,
         pack_n=pack_n,
         split_k=split_k,
-        b_preshuffle=True,
-    ).to(torch.float32)
+        b_preshuffle=b_preshuffle,
+    )
     assert _check_output(ref, out)
 
     bytes_moved = (m * k * a.element_size()) + (n * k * b.element_size()) + (m * n * a.element_size())
@@ -153,19 +166,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run FlyDSL preshuffle split-K HGEMM test")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
     parser.add_argument("-m", type=int, default=128)
-    parser.add_argument("-n", type=int, default=10240)
+    parser.add_argument("-n", type=int, default=1024)
     parser.add_argument("-k", type=int, default=8192)
     parser.add_argument("--tile-k", type=int, default=64)
     parser.add_argument("--tile-m", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=128)
     parser.add_argument("--pack-n", type=int, default=1)
     parser.add_argument("--split-k", type=int, default=1)
+    parser.add_argument("--b-preshuffle", action="store_true", default=False)
     parser.add_argument("--num-warmup", type=int, default=DEFAULT_BENCH_WARMUP)
     parser.add_argument("--num-iters", type=int, default=DEFAULT_BENCH_ITERS)
     parser.add_argument("--test-graph", action="store_true", default=False)
     args = parser.parse_args()
 
-    test_flydsl_preshuffle_splitk_hgemm(
+    test_flydsl_splitk_hgemm(
         args.dtype,
         m=args.m,
         n=args.n,
@@ -175,6 +189,7 @@ if __name__ == "__main__":
         tile_n=args.tile_n,
         pack_n=args.pack_n,
         split_k=args.split_k,
+        b_preshuffle=args.b_preshuffle,
         test_graph=args.test_graph,
         bench_iters=args.num_iters,
         bench_warmup=args.num_warmup,

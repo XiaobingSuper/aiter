@@ -28,6 +28,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.ops.flydsl import flydsl_hgemm
 from torch import Tensor
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -52,45 +53,12 @@ tuned_df = pd.DataFrame(
 
 @functools.lru_cache(maxsize=1)
 def get_GEMM_A16W16_flydsl_tuned_files_():
-    tuned_files = []
-    env_files = os.getenv("AITER_CONFIG_GEMM_BF16_FLYDSL", "")
-    if env_files:
-        tuned_files.extend(path for path in env_files.split(os.pathsep) if path)
-    else:
-        for tuned_file in AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE.split(os.pathsep):
-            if not tuned_file:
-                continue
-            file_path = Path(tuned_file)
-            if file_path.name.endswith("_bf16_tuned_gemm.csv"):
-                tuned_files.append(
-                    str(
-                        file_path.with_name(
-                            file_path.name.replace(
-                                "_bf16_tuned_gemm.csv",
-                                "_flydsl_bshuffle_bf16_tuned_gemm.csv",
-                            )
-                        )
-                    )
-                )
-            elif file_path.name.endswith("bf16_tuned_gemm.csv"):
-                tuned_files.append(
-                    str(
-                        file_path.with_name(
-                            file_path.name.replace(
-                                "bf16_tuned_gemm.csv",
-                                "flydsl_bshuffle_bf16_tuned_gemm.csv",
-                            )
-                        )
-                    )
-                )
-        model_config_dir = Path(this_dir) / "configs" / "model_configs"
-        tuned_files.extend(
-            str(path)
-            for path in sorted(
-                model_config_dir.glob("*_flydsl_bshuffle_bf16_tuned_gemm.csv")
-            )
-            if path.is_file() and "untuned" not in str(path)
-        )
+    model_config_dir = Path(this_dir) / "configs" / "model_configs"
+    tuned_files = [
+        str(path)
+        for path in sorted(model_config_dir.glob("*_flydsl_bf16_tuned_gemm.csv"))
+        if path.is_file() and "untuned" not in str(path)
+    ]
     dedup_files = []
     for tuned_file in tuned_files:
         if tuned_file not in dedup_files and os.path.exists(tuned_file):
@@ -172,7 +140,8 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
 ):
     cfg = get_GEMM_A16W16_config_()
-    flydsl_cfg = get_GEMM_A16W16_flydsl_config_() if bpreshuffle else {}
+    # Dedicated FlyDSL CSVs can carry both bpreshuffle=True/False entries.
+    flydsl_cfg = get_GEMM_A16W16_flydsl_config_()
     cu_num = get_cu_num()
     padded_M = M
     config = None
@@ -555,9 +524,6 @@ def flydsl_gemm(
     split_k: int = 1,
     bpreshuffle: bool = False,
 ):
-    from aiter.ops.flydsl import flydsl_hgemm
-
-    assert bpreshuffle, "FlyDSL hgemm requires bpreshuffle=True."
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
@@ -570,7 +536,7 @@ def flydsl_gemm(
         pack_n=int(pack_n),
         stages=int(stages),
         split_k=int(split_k),
-        b_preshuffle=True,
+        b_preshuffle=bpreshuffle,
     )
     if bias is not None:
         out = out if otype is None else out.to(otype)

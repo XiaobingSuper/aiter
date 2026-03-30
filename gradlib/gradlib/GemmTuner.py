@@ -99,7 +99,7 @@ def run_flydsl_gemm_bf16(
         stages=stages,
         pack_n=pack,
         split_k=splitK,
-        b_preshuffle=True,
+        b_preshuffle=False,
     )
 
 
@@ -168,6 +168,7 @@ def generate_data_flydsl(
     pack=1,
     device="cuda:0",
 ):
+    del pack
     (
         inp,
         weights,
@@ -189,8 +190,7 @@ def generate_data_flydsl(
         bias,
         device,
     )
-    flydsl_weights = shuffle_weight(weights, layout=(16 * pack, 16))
-    return (inp, weights, weights_t, bias_tensor, x_scale, out, flydsl_weights, w_scale)
+    return (inp, weights, weights_t, bias_tensor, x_scale, out, weights, w_scale)
 
 
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
@@ -248,7 +248,7 @@ FLYDSL_TILE_KS = (64, 128)
 FLYDSL_TILE_MS = (16, 32, 48, 64, 96, 128)
 FLYDSL_TILE_NS = (64, 128, 256)
 FLYDSL_PACKS = (1,)
-FLYDSL_SPLITKS = (1, 2, 4)
+FLYDSL_SPLITKS = (1, 2, 4, 8)
 FLYDSL_STAGES = (1, 2)
 
 
@@ -320,7 +320,7 @@ def get_flydsl_dtype_tag(dtype):
 def get_flydsl_kernel_name(dtype, tile_m, tile_n, tile_k, stages, pack, splitK):
     del pack
     dtype_tag = get_flydsl_dtype_tag(dtype)
-    kernel_name = f"hgemm_{dtype_tag}_{tile_m}x{tile_n}x{tile_k}_S{stages}TN_BP"
+    kernel_name = f"hgemm_{dtype_tag}_{tile_m}x{tile_n}x{tile_k}_S{stages}TN"
     if splitK > 1:
         kernel_name += f"_SPK{splitK}"
     return kernel_name
@@ -591,8 +591,8 @@ class Gemm:
         return task_asm
 
     def flydsl_gemm_all_sols(self):
-        if not self.is_shuffle:
-            logger.warning("FlyDSL gemm only supports bpreshuffle=True")
+        if self.is_shuffle:
+            logger.warning("FlyDSL gemm only supports bpreshuffle=False")
             return []
         if self.has_bias:
             logger.warning("FlyDSL gemm does not support bias yet")

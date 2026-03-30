@@ -18,7 +18,9 @@ __all__ = [
 ]
 
 SPLIT_K_COUNTER_MAX_LEN = 128
+SPLIT_K_SIGNAL_STATE_COUNT = 3
 SPLIT_K_GLOBAL_SEMAPHORE: dict[torch.device, torch.Tensor] = {}
+SPLIT_K_GLOBAL_SEMAPHORE_STATE: dict[torch.device, int] = {}
 
 
 def _to_kernel_dtype(dtype: torch.dtype) -> str:
@@ -157,10 +159,23 @@ def _get_split_k_global_semaphore(device: torch.device) -> torch.Tensor:
     semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(device)
     if semaphore is None:
         semaphore = torch.zeros(
-            (SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device
+            (SPLIT_K_SIGNAL_STATE_COUNT * SPLIT_K_COUNTER_MAX_LEN,),
+            dtype=torch.int32,
+            device=device,
         )
         SPLIT_K_GLOBAL_SEMAPHORE[device] = semaphore
+        SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = int(0)
     return semaphore
+
+
+def _get_split_k_signal_state(device: torch.device) -> int:
+    return SPLIT_K_GLOBAL_SEMAPHORE_STATE[device]
+
+
+def _advance_split_k_signal_state(device: torch.device) -> None:
+    SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = (
+        _get_split_k_signal_state(device) + 1
+    ) % SPLIT_K_SIGNAL_STATE_COUNT
 
 
 def _check_split_k_counter_capacity(
@@ -196,6 +211,7 @@ def compile_flydsl_hgemm(
     b_preshuffle: bool = True,
     split_k: int = 1,
     c_to_lds: bool = False,
+    signal_state: int = 0,
 ):
     """Compile and cache a FlyDSL HGEMM kernel launcher."""
 
@@ -220,6 +236,7 @@ def compile_flydsl_hgemm(
 
     kernel = compile_hgemm_kernel(
         dtype,
+        signal_state,
         n,
         k,
         TILE_K=tile_k,
@@ -298,6 +315,9 @@ def flydsl_hgemm(
     if out is None:
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
 
+    _get_split_k_global_semaphore(a.device)
+    signal_state = _get_split_k_signal_state(a.device)
+
     launcher = compile_flydsl_hgemm(
         kernel_dtype,
         m,
@@ -315,7 +335,10 @@ def flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         split_k=split_k,
         c_to_lds=c_to_lds,
+        signal_state=signal_state,
     )
 
     launcher(out, a, b)
+    if split_k > 1:
+        _advance_split_k_signal_state(a.device)
     return out
