@@ -354,6 +354,7 @@ class GroupCoordinator:
         # only cuda uses this function,
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
+        maybe_flydsl_context = nullcontext()
         from aiter.dist.device_communicators.communicator_cuda import (
             CudaCommunicator,
         )
@@ -364,13 +365,25 @@ class GroupCoordinator:
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
 
+        if globals().get("_TP") is self:
+            try:
+                from aiter.ops.flydsl.hgemm_ar import (
+                    _get_tp_flydsl_hgemm_ar_capture_context,
+                )
+
+                maybe_flydsl_context = _get_tp_flydsl_hgemm_ar_capture_context(
+                    torch.device(f"cuda:{torch.cuda.current_device()}")
+                )
+            except Exception:
+                maybe_flydsl_context = nullcontext()
+
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with torch.cuda.stream(stream), maybe_ca_context, maybe_flydsl_context:
             yield graph_capture_context
 
     def all_reduce(

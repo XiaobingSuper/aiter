@@ -1,0 +1,6 @@
+world_size,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,kernelName,us,err_ratio,tflops,bw
+8,256,2,7168,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl_ar,hgemm_ar_bf16_32x128x128_S2TN_AS_W2x2_BS,53.254,0.0,0.55,276.28
+8,256,4,7168,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl_ar,hgemm_ar_bf16_32x256x64_S2TN_AS_W1x4,56.534,0.0,1.04,260.83
+8,256,8,7168,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl_ar,hgemm_ar_bf16_32x128x64_S2TN_AS_W1x4,39.666,0.0,2.96,373.4
+8,256,16,7168,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl_ar,hgemm_ar_bf16_32x128x64_S2TN_AS_W1x4,39.8468,0.0,5.89,374.99
+8,256,32,7168,1024,False,torch.bfloat16,torch.bfloat16,False,False,flydsl_ar,hgemm_ar_bf16_32x128x64_S2TN_AS_W1x4,41.4637,0.0,11.33,366.69

@@ -43,10 +43,12 @@ if is_flydsl_available():
     )
 
     from .gemm_kernels import flydsl_hgemm
+    from .hgemm_ar import flydsl_hgemm_ar
 
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
+        "flydsl_hgemm_ar",
     ]
