@@ -20,9 +20,9 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.gemm_kernels import FIXED_C_TO_LDS, FIXED_STAGE, KERNEL_ASYNC_COPY
 from aiter.ops.flydsl.kernels.hgemm_ar_params import get_flydsl_tp_hgemm_ar_kernel_params
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.gemm_op_common import get_padded_m
 from aiter.tuned_gemm import tgemm
 from torch import Tensor
 
@@ -118,37 +118,35 @@ def get_GEMM_A16W16_AR_config(
     cu_num = get_cu_num()
 
     for candidate_cu_num in (cu_num, -1):
-        for gl in [None, 0, 1]:
-            padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-            config = cfg.get(
-                (
-                    world_size,
-                    candidate_cu_num,
-                    padded_M,
-                    N,
-                    K,
-                    bias,
-                    str(dtype),
-                    str(otype),
-                    scaleAB,
-                    bpreshuffle,
-                    "flydsl_ar",
-                )
+        config = cfg.get(
+            (
+                world_size,
+                candidate_cu_num,
+                M,
+                N,
+                K,
+                bias,
+                str(dtype),
+                str(otype),
+                scaleAB,
+                bpreshuffle,
+                "flydsl_ar",
             )
-            if config is None:
+        )
+        if config is None:
+            continue
+        if config.get("libtype") == "flydsl_ar":
+            kname = config.get("kernelName")
+            if kname is None or pd.isna(kname) or not is_flydsl_available():
                 continue
-            if config.get("libtype") == "flydsl_ar":
-                kname = config.get("kernelName")
-                if kname is None or pd.isna(kname) or not is_flydsl_available():
-                    continue
-                flydsl_config = get_flydsl_tp_hgemm_ar_kernel_params(str(kname).strip())
-                if flydsl_config is None:
-                    continue
-                if _config_bool(config.get("bpreshuffle")) != bool(
-                    flydsl_config["bpreshuffle"]
-                ):
-                    continue
-            return dict(config)
+            flydsl_config = get_flydsl_tp_hgemm_ar_kernel_params(str(kname).strip())
+            if flydsl_config is None:
+                continue
+            if _config_bool(config.get("bpreshuffle")) != bool(
+                flydsl_config["bpreshuffle"]
+            ):
+                continue
+        return dict(config)
     return None
 
 
@@ -199,10 +197,13 @@ def flydsl_gemm_ar(
         tile_n=flydsl_config["tile_n"],
         tile_k=flydsl_config["tile_k"],
         split_k=flydsl_config["splitK"],
+        stages=FIXED_STAGE,
+        async_copy=KERNEL_ASYNC_COPY,
         block_m_warps=flydsl_config["block_m_warps"],
         block_n_warps=flydsl_config["block_n_warps"],
         b_to_lds=flydsl_config["b_to_lds"],
         b_preshuffle=flydsl_config["bpreshuffle"],
+        c_to_lds=FIXED_C_TO_LDS,
         use_atomic_add=flydsl_config.get("use_atomic_add", False),
     )
     if bias is not None:
@@ -314,7 +315,7 @@ def gemm_a16w16_tp_allreduce(
                 k,
                 exc,
             )
-    # print why not fused
+
     out = tgemm.mm(
         A,
         B,

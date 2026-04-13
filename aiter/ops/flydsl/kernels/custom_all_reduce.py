@@ -286,7 +286,8 @@ class FlyDSLAllreduce:
         finally:
             self._IS_CAPTURING = False
             if self._pending_graph_entries:
-                self._register_graph_outputs()
+                with torch.inference_mode():
+                    self._register_graph_outputs()
 
     @classmethod
     def _get_alloc_base_ptr(cls, dev_ptr: int) -> int:
@@ -317,7 +318,11 @@ class FlyDSLAllreduce:
         if cached is not None:
             return cached
 
-        per_call_ptrs = torch.empty(8, dtype=torch.int64, device=self.device)
+        # During graph capture the kernel immediately dereferences `out_ptrs`,
+        # so seed the table with the always-valid eager output buffers. Once
+        # capture finishes, `_register_graph_outputs()` mutates the same tensor
+        # in-place to the graph output addresses used during replay.
+        per_call_ptrs = self._gpu_output_buffer_ptrs_array.clone()
         self._pending_graph_entries.append((out, per_call_ptrs))
         self._graph_ptrs_cache[ptr] = per_call_ptrs
         return per_call_ptrs

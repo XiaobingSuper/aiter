@@ -332,7 +332,6 @@ def flydsl_hgemm_ar(
 
     if out is None:
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-
     backend = _get_tp_flydsl_hgemm_ar_backend(a.device, max_size=max_size)
     if not backend.should_fuse(out):
         raise ValueError("Current tensor-parallel setup does not support FlyDSL HGEMM AR")
