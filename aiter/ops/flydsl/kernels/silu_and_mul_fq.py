@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused silu_and_mul + MXFP4 quantization + sorted-scale write kernel (FlyDSL).
+"""Fused gate-activation-and-mul + MXFP4 quantization + sorted-scale write kernel (FlyDSL).
 
 Designed for split-K MOE stage1 post-processing:
 
@@ -18,7 +18,7 @@ Each workgroup:
   1. Loads sorted_token_ids[bid] -> (token_id, slot_id) -> row = token_id * topk + slot_id
   2. If bid < num_valid_ids (valid row):
      a. Reads gate = tmp_out[row, 0:inter_dim], up = tmp_out[row, inter_dim:2*inter_dim]
-     b. Computes silu(gate) * up in f32
+     b. Computes the requested gate activation in f32 and multiplies by up
      c. Per-1x32 MXFP4 quant -> writes packed FP4 + E8M0 scale in tiled layout
   3. If bid >= num_valid_ids (blockM padding row):
      a. Writes zero FP4 bytes to out_fp4
@@ -40,8 +40,8 @@ BLOCK_THREADS = 256
 WARP_SIZE = 64
 
 
-def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
-    """Return a JIT launcher for fused silu_and_mul + mxfp4 quant + scale sort.
+def build_silu_and_mul_fq_module(inter_dim: int, topk: int, act: str = "silu"):
+    """Return a JIT launcher for fused gate-activation-and-mul + mxfp4 quant + scale sort.
 
     Parameters
     ----------
@@ -52,6 +52,8 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
         Number of expert slots per token.
     """
     assert inter_dim % 32 == 0, f"inter_dim={inter_dim} must be divisible by 32"
+    if act not in ("silu", "swiglu"):
+        raise ValueError(f"Unsupported activation for split-K FP4 path: {act!r}")
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -216,6 +218,11 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                     up_f32 = up_bf16.extf(vec_f32_ty)
 
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                    swiglu_neg_alpha_log2e = arith.constant(
+                        -1.4426950408889634 * 1.702, type=f32
+                    )
+                    swiglu_limit = arith.constant(7.0, type=f32)
+                    swiglu_neg_limit = arith.constant(-7.0, type=f32)
                     act_vals = []
                     for vi in range_constexpr(VEC):
                         g = vector.extract(
@@ -224,7 +231,16 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                         u = vector.extract(
                             up_f32, static_position=[vi], dynamic_position=[]
                         )
-                        t = g * neg_log2e
+                        if act == "swiglu":
+                            gate = arith.minimumf(g, swiglu_limit)
+                            linear = arith.maximumf(
+                                arith.minimumf(u, swiglu_limit), swiglu_neg_limit
+                            )
+                            t = gate * swiglu_neg_alpha_log2e
+                        else:
+                            gate = g
+                            linear = u
+                            t = g * neg_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
                         )
@@ -232,7 +248,10 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                         sig = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
-                        act_vals.append(g * sig * u)
+                        if act == "swiglu":
+                            act_vals.append(gate * sig * (linear + c1_f32))
+                        else:
+                            act_vals.append(gate * sig * linear)
 
                     local_max = c0_f32
                     for vi in range_constexpr(VEC):

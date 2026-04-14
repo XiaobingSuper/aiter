@@ -289,7 +289,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = {
+            ActivationType.Silu: "silu",
+            ActivationType.Gelu: "gelu",
+            ActivationType.Swiglu: "swiglu",
+        }[act_type]
         fuse_fq = kparams.get("fuse_fp4_quant", False)
         token_num = a1_qt.shape[0]
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
@@ -608,13 +612,6 @@ class FmoeTuner(TunerCommon):
             )
             a1_qt = a1_qt.view(token, model_dim)
             a1_scale = a1_scale.squeeze(-1)
-        elif (
-            q_type == aiter.QuantType.per_1x32
-            and (q_dtype_a in [dtypes.bf16, dtypes.fp16])
-            and q_dtype_w == dtypes.fp4x2
-        ):  # a16w4
-            a1_qt = input.to(dtype)
-            a1_scale = None
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
@@ -824,15 +821,15 @@ class FmoeTuner(TunerCommon):
             if not doweight_stage1:
                 sorted_weights = None
             if q_type == QuantType.per_1x32:
-                a1_scale_fp4_sort = moe_mxfp4_sort(
-                    a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
+                a1_scale_kernel = moe_mxfp4_sort(
+                    a1_scale,
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
                     block_size=max(32, blockM),
                 )
             else:
-                a1_scale_fp4_sort = a1_scale
+                a1_scale_kernel = a1_scale
 
             return (
                 a1_qt,  # 0
@@ -849,7 +846,7 @@ class FmoeTuner(TunerCommon):
                 w2_qt,  # 11
                 topk_weights,  # 12
                 topk_ids,  # 13
-                a1_scale_fp4_sort,  # 14
+                a1_scale_kernel,  # 14
                 w1_scale_aiter,  # 15
                 w1_qt_shffle_flydsl,  # 16
                 w2_qt_shffle_flydsl,  # 17
@@ -879,11 +876,11 @@ class FmoeTuner(TunerCommon):
                 ref_scale = ref_scale.view(token, -1)
                 a2_qt = ref1
                 a2_scale = ref_scale
-                a2_scale_mxfp4_sort = a2_scale
+                a2_scale_kernel = a2_scale
             elif q_type == QuantType.per_1x32:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
-                a2_scale_mxfp4_sort = moe_mxfp4_sort(
+                a2_scale_kernel = moe_mxfp4_sort(
                     a2_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
@@ -893,7 +890,7 @@ class FmoeTuner(TunerCommon):
             else:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
-                a2_scale_mxfp4_sort = a2_scale
+                a2_scale_kernel = a2_scale
             a2_qt = a2_qt.view(token, topk, -1)
             if doweight_stage1:
                 sorted_weights = None
@@ -912,7 +909,7 @@ class FmoeTuner(TunerCommon):
                 w2_qt,  # 11
                 topk_weights,  # 12
                 topk_ids,  # 13
-                a2_scale_mxfp4_sort,  # 14
+                a2_scale_kernel,  # 14
                 w2_scale_aiter,  # 15
                 w1_qt_shffle_flydsl,  # 16
                 w2_qt_shffle_flydsl,  # 17
@@ -2382,7 +2379,12 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            try:
+                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            except ValueError as exc:
+                if "Unsupported data type combination" not in str(exc):
+                    raise
+                print(f"skip CK 2stage tasks for {info}: {exc}")
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:

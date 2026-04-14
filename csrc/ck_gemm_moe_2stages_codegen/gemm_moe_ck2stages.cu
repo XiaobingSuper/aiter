@@ -13,6 +13,21 @@
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
+namespace {
+
+int to_ck_act_op(int activation)
+{
+    switch(static_cast<ActivationType>(activation))
+    {
+    case ActivationType::Gelu: return 0;
+    case ActivationType::Silu: return 1;
+    case ActivationType::Swiglu: return 2;
+    default: return activation;
+    }
+}
+
+} // namespace
+
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
@@ -108,7 +123,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_act_op(activation);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
@@ -172,7 +187,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_act_op(activation);
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),

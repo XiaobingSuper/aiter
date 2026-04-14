@@ -112,9 +112,9 @@ def compile_mixed_moe_gemm1(
     b_nt: int = 0,
     gate_only: bool = False,
 ):
-    """Compile stage1 kernel (gate+up with silu) based on stage2 structure.
+    """Compile stage1 kernel (gate+up with silu/swiglu) based on stage2 structure.
 
-    GEMM: silu(X @ W_gate.T) * (X @ W_up.T) -> [tokens*topk, inter_dim]
+    GEMM: act(X @ W_gate.T) * (X @ W_up.T) -> [tokens*topk, inter_dim]
     Direct store (no atomic).  When k_batch>1 (split-K), each CTA
     computes a K-slice and atomically adds gate/up partials.
     Note: persist_m=1 (no persistence) is optimal for stage1 because K=model_dim
@@ -141,6 +141,9 @@ def compile_mixed_moe_gemm1(
         raise ValueError(
             f"b_dtype must be one of ('fp8','fp16','int8','int4','fp4'), got {b_dtype!r}"
         )
+    act = str(act).strip().lower()
+    if act not in ("silu", "swiglu"):
+        raise ValueError(f"stage1 act must be 'silu' or 'swiglu', got {act!r}")
 
     is_f16_a = a_dtype == "fp16"
     is_f16_b = b_dtype == "fp16"
@@ -248,7 +251,7 @@ def compile_mixed_moe_gemm1(
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
     _go_tag = "_go" if gate_only else ""
     module_name = (
-        f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
+        f"mfma_moe1_{act}_mul_a{a_dtype}_w{b_dtype}_{out_s}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v32"
     ).replace("-", "_")
 
@@ -1756,8 +1759,7 @@ def compile_mixed_moe_gemm1(
                         prefetch_epilogue=True,
                     )
 
-                # silu(gate) * up in f32 before epilogue
-                # silu(x) = x * sigmoid(x); use HW fast path: exp2, rcp
+                # Apply the requested gate activation in f32 before epilogue.
                 def _silu_mul_vec4(gate_v4, up_v4):
                     """Element-wise silu(gate) * up on vec4_f32."""
                     result_elems = []
@@ -1781,16 +1783,51 @@ def compile_mixed_moe_gemm1(
                         result_elems.append(g * sig * u)
                     return vector.from_elements(vec4_f32, result_elems)
 
+                def _swiglu_mul_vec4(gate_v4, up_v4):
+                    """Element-wise gpt-oss swiglu(gate, up) on vec4_f32."""
+                    result_elems = []
+                    swiglu_limit = arith.constant(7.0, type=f32)
+                    swiglu_neg_limit = arith.constant(-7.0, type=f32)
+                    neg_alpha_log2e = arith.constant(
+                        -1.4426950408889634 * 1.702, type=f32
+                    )
+                    one = arith.constant(1.0, type=f32)
+                    for ei in range_constexpr(4):
+                        g = vector.extract(
+                            gate_v4, static_position=[ei], dynamic_position=[]
+                        )
+                        u = vector.extract(
+                            up_v4, static_position=[ei], dynamic_position=[]
+                        )
+                        g = arith.minimumf(g, swiglu_limit)
+                        u = arith.maximumf(
+                            arith.minimumf(u, swiglu_limit), swiglu_neg_limit
+                        )
+                        t = g * neg_alpha_log2e
+                        emu = llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                        )
+                        den = one + emu
+                        sig = llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [den], [], []
+                        )
+                        result_elems.append(g * sig * (u + one))
+                    return vector.from_elements(vec4_f32, result_elems)
+
                 if not _is_splitk:
                     acc = [None] * (int(num_acc_n) * int(m_repeat))
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
                             _aidx = _mi * num_acc_n + _ni
-                            acc[_aidx] = _silu_mul_vec4(acc_gate[_aidx], acc_up[_aidx])
+                            acc[_aidx] = (
+                                _swiglu_mul_vec4(acc_gate[_aidx], acc_up[_aidx])
+                                if act == "swiglu"
+                                else _silu_mul_vec4(acc_gate[_aidx], acc_up[_aidx])
+                            )
 
                 # ---- Epilogue: CShuffle + direct store (accumulate=False) ----
-                # Output: out[(t*topk+s) * inter_dim + col] = silu(gate) * up
-                # For split-K: skip silu, output gate/up separately with atomic add
+                # Output: out[(t*topk+s) * inter_dim + col] = act(gate, up)
+                # For split-K: skip activation, output gate/up separately with atomic add
                 tw_pf = None
                 if epilogue_pf is not None:
                     _, tw_pf, _ = epilogue_pf

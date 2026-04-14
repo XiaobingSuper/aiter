@@ -5,6 +5,8 @@ import argparse
 import itertools
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
+ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglu": 2}
+
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages_common{quanttype}.cuh"
@@ -264,7 +266,7 @@ A8W4_gemm1_heuristic_dispatch = """
 """
 
 A4W4_gemm1_heuristic_dispatch = """
-#if defined(__Float4_e2m1fn_x2)
+#if defined(__Float4_e2m1fn_x2) || defined(TORCH_Float4_e2m1fn_x2)
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
@@ -298,7 +300,7 @@ A4W4_gemm1_heuristic_dispatch = """
 """
 
 A4W4_bns_gemm1_heuristic_dispatch = """
-#if defined(__Float4_e2m1fn_x2)
+#if defined(__Float4_e2m1fn_x2) || defined(TORCH_Float4_e2m1fn_x2)
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
@@ -617,7 +619,7 @@ A8W4_gemm2_heuristic_dispatch = """
 
 
 A4W4_gemm2_heuristic_dispatch = """
-#if defined(__Float4_e2m1fn_x2)
+#if defined(__Float4_e2m1fn_x2) || defined(TORCH_Float4_e2m1fn_x2)
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
@@ -674,7 +676,7 @@ A4W4_gemm2_heuristic_dispatch = """
 """
 
 A4W4_bns_gemm2_heuristic_dispatch = """
-#if defined(__Float4_e2m1fn_x2)
+#if defined(__Float4_e2m1fn_x2) || defined(TORCH_Float4_e2m1fn_x2)
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
@@ -926,7 +928,7 @@ class ck_moe_2stage_gemm_codegen:
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
                             ActOP=(
-                                int(self.activation == "silu")
+                                ACT_OP_MAP[self.activation]
                                 if kernel.stage == 1
                                 else 0
                             ),
@@ -958,7 +960,7 @@ class ck_moe_2stage_gemm_codegen:
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
-                    ActOP=int(self.activation == "silu") if kernel.stage == 1 else 0,
+                    ActOP=ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0,
                     Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
@@ -989,7 +991,7 @@ class ck_moe_2stage_gemm_codegen:
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
-                ActOP=str(int(self.activation == "silu")),
+                ActOP=str(ACT_OP_MAP[self.activation]),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
@@ -1071,7 +1073,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu"],
+        choices=["silu", "gelu", "swiglu"],
         help="select activation",
     )
 

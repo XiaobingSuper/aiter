@@ -265,13 +265,13 @@ def fused_moe_(
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            elif M >= bf16_fp8_bound:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
+        # if activation == ActivationType.Swiglu:
+        #     if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+        #         q_dtype_a = dtypes.bf16
+        #     elif M >= bf16_fp8_bound:
+        #         q_dtype_a = dtypes.fp8
+        # else:
+        q_dtype_a = dtypes.fp4x2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -1407,6 +1407,8 @@ def asm_stage1(
     if ksplit > 0:
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+        elif activation == ActivationType.Swiglu:
+            aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         else:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
     return out
@@ -1726,6 +1728,8 @@ def ck_moe_stage1(
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+        elif activation == ActivationType.Swiglu:
+            aiter.swiglu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
     return out
@@ -1800,6 +1804,8 @@ def cktile_moe_stage1(
     if split_k > 1:
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
+        elif activation == ActivationType.Swiglu:
+            aiter.swiglu_and_mul(out, tmp_out)
         else:
             aiter.gelu_and_mul(out, tmp_out)
     return out

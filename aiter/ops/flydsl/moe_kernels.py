@@ -214,6 +214,11 @@ def compile_flydsl_moe_stage1(
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
+        if act != "silu":
+            raise ValueError(
+                f"FlyDSL stage1 act={act!r} is only supported on the mixed fp4 path"
+            )
+
         return compile_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -450,11 +455,11 @@ def _run_compiled(exe, args):
 
 
 @functools.cache
-def _get_compiled_silu_fq(inter_dim: int, topk: int):
-    """Compile and cache the fused silu_and_mul + mxfp4 quant + scale-sort kernel."""
+def _get_compiled_silu_fq(inter_dim: int, topk: int, act: str):
+    """Compile and cache the fused gate-activation + mxfp4 quant kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
-    return build_silu_and_mul_fq_module(inter_dim, topk)
+    return build_silu_and_mul_fq_module(inter_dim, topk, act=act)
 
 
 # Public API
@@ -498,7 +503,7 @@ def flydsl_moe_stage1(
     layout directly, avoiding a separate moe_mxfp4_sort call.
 
     When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
-    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+    add into a zeroed buffer, then the requested gate activation fuses reduction.
 
     When gate_only=True (requires k_batch>1), each workgroup computes only
     one B-tile stream (no gate/up interleaving).  The grid X doubles so
@@ -582,8 +587,8 @@ def flydsl_moe_stage1(
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
 
-    # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
-    # handles activation + quant + scale-sort after the GEMM completes.
+    # split-K GEMM kernel does not fuse quant; the fused postprocess kernel
+    # handles gate activation + quant + scale-sort after the GEMM completes.
     _gemm_fq = fuse_fp4_quant and not _is_splitk
     _gemm_fss = fuse_sort_scale and not _is_splitk
 
@@ -652,7 +657,7 @@ def flydsl_moe_stage1(
     _run_compiled(exe, args)
 
     if _splitk_fq:
-        _silu_fq = _get_compiled_silu_fq(inter_dim, topk)
+        _silu_fq = _get_compiled_silu_fq(inter_dim, topk, act)
         num_sorted_rows = sorted_token_ids.shape[0]
         _run_compiled(
             _silu_fq,
@@ -668,9 +673,10 @@ def flydsl_moe_stage1(
             ),
         )
     elif _is_splitk:
-        from aiter.ops.activation import silu_and_mul
+        from aiter.ops.activation import silu_and_mul, swiglu_and_mul
 
-        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+        post_act = swiglu_and_mul if act == "swiglu" else silu_and_mul
+        post_act(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
     if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0

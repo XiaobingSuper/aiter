@@ -70,6 +70,11 @@ namespace py = pybind11;
           "Activation function used in SwiGLU.",        \
           py::arg("out"),                               \
           py::arg("input"));                            \
+    m.def("swiglu_and_mul",                             \
+          &aiter::swiglu_and_mul,                       \
+          "Activation function used in GPT-OSS SwiGLU.",\
+          py::arg("out"),                               \
+          py::arg("input"));                            \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \
