@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -22,6 +23,12 @@ from .gemm_kernels import (
     _to_kernel_dtype,
     _validate_hgemm_inputs,
     _validate_hgemm_tiling,
+    flydsl_hgemm,
+)
+from .hgemm_qr import (
+    experimental_hgemm_qr_enabled,
+    flydsl_hgemm_qr,
+    supports_hgemm_qr,
 )
 from .kernels.custom_all_reduce import FlyDSLAllreduce, _DEFAULT_MAX_SIZE
 from .kernels.splitk_hgemm_ar import compile_hgemm_ar_kernel
@@ -53,6 +60,7 @@ _REQUIRED_HGEMM_AR_KWARGS = (
     "B_PRE_SHUFFLE",
     "B_TO_LDS",
 )
+_QUICK_REDUCE_QUANTIZATIONS = {"FP", "FP8", "INT6", "INT4"}
 
 
 def _check_hgemm_ar_block_capacity(
@@ -97,6 +105,73 @@ def _normalize_hgemm_ar_kwargs(hgemm_kwargs: Optional[dict]) -> dict:
         kwargs["SPLIT_K"]
     ) > 1
     return kwargs
+
+
+def _is_quick_reduce_enabled() -> bool:
+    regime = str(os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", "")).strip().upper()
+    return regime in _QUICK_REDUCE_QUANTIZATIONS
+
+
+def _get_quick_reduce_comm(out: torch.Tensor):
+    if not _is_quick_reduce_enabled():
+        return None
+
+    tp_group = get_tp_group()
+    device_communicator = getattr(tp_group, "device_communicator", None)
+    qr_comm = getattr(device_communicator, "qr_comm", None)
+    if qr_comm is None or getattr(qr_comm, "disabled", True):
+        return None
+    if not qr_comm.should_quick_allreduce(out):
+        return None
+    return qr_comm
+
+
+def _run_hgemm_then_quick_reduce(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    pack_n: int,
+    split_k: int,
+    block_m_warps: int,
+    block_n_warps: int,
+    stages: int,
+    async_copy: bool,
+    b_to_lds: bool,
+    b_preshuffle: bool,
+    auto_shuffle_b: bool,
+    c_to_lds: bool,
+    stream: Optional[torch.cuda.Stream],
+    qr_comm,
+) -> torch.Tensor:
+    launch_stream = _normalize_launch_stream(a.device, stream)
+    with torch.cuda.stream(launch_stream):
+        out = flydsl_hgemm(
+            a,
+            b,
+            out=out,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            pack_n=pack_n,
+            split_k=split_k,
+            block_m_warps=block_m_warps,
+            block_n_warps=block_n_warps,
+            stages=stages,
+            async_copy=async_copy,
+            b_to_lds=b_to_lds,
+            b_preshuffle=b_preshuffle,
+            auto_shuffle_b=auto_shuffle_b,
+            c_to_lds=c_to_lds,
+            stream=launch_stream,
+        )
+        # QuickReduce reads the full input tile into registers before writing
+        # the reduced result, so aliasing inp/out avoids an extra buffer.
+        qr_comm.quick_all_reduce(out, out=out)
+    return out
 
 
 def _run_hgemm_ar(
@@ -332,6 +407,60 @@ def flydsl_hgemm_ar(
 
     if out is None:
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    if experimental_hgemm_qr_enabled() and supports_hgemm_qr(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        split_k=split_k,
+        block_m_warps=block_m_warps,
+        block_n_warps=block_n_warps,
+        pack_n=pack_n,
+    ):
+        try:
+            return flydsl_hgemm_qr(
+                a,
+                b,
+                out=out,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                pack_n=pack_n,
+                split_k=split_k,
+                block_m_warps=block_m_warps,
+                block_n_warps=block_n_warps,
+                stages=stages,
+                async_copy=async_copy,
+                b_to_lds=b_to_lds,
+                b_preshuffle=b_preshuffle,
+                auto_shuffle_b=auto_shuffle_b,
+                c_to_lds=c_to_lds,
+                stream=stream,
+                max_size=max_size,
+            )
+        except ValueError:
+            pass
+    quick_reduce_comm = _get_quick_reduce_comm(out)
+    if quick_reduce_comm is not None:
+        return _run_hgemm_then_quick_reduce(
+            a,
+            b,
+            out,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            pack_n=pack_n,
+            split_k=split_k,
+            block_m_warps=block_m_warps,
+            block_n_warps=block_n_warps,
+            stages=stages,
+            async_copy=async_copy,
+            b_to_lds=b_to_lds,
+            b_preshuffle=b_preshuffle,
+            auto_shuffle_b=auto_shuffle_b,
+            c_to_lds=c_to_lds,
+            stream=stream,
+            qr_comm=quick_reduce_comm,
+        )
     backend = _get_tp_flydsl_hgemm_ar_backend(a.device, max_size=max_size)
     if not backend.should_fuse(out):
         raise ValueError("Current tensor-parallel setup does not support FlyDSL HGEMM AR")
