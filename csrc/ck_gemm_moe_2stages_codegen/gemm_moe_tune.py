@@ -136,6 +136,8 @@ class FmoeTuner(TunerCommon):
                 fmoe_module.cfg_2stages = None
             if hasattr(fmoe_module, "get_2stage_cfgs"):
                 fmoe_module.get_2stage_cfgs.cache_clear()
+            if hasattr(fmoe_module, "_get_tuned_mxfp4_q_dtype_a"):
+                fmoe_module._get_tuned_mxfp4_q_dtype_a.cache_clear()
         except ImportError:
             pass
 
@@ -147,6 +149,106 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
+
+    @staticmethod
+    def _expand_mxfp4_dtype_candidates(df):
+        """Tune both activation dtype paths so runtime can choose by CSV result."""
+        required = {
+            "act_type",
+            "dtype",
+            "q_dtype_a",
+            "q_dtype_w",
+            "q_type",
+            "use_g1u1",
+            "doweight_stage1",
+        }
+        if df.empty or not required.issubset(df.columns):
+            return df
+
+        def _as_int(value):
+            return int(float(value))
+
+        def _base_activation_dtype(dtype):
+            if str(dtype) == "torch.float16":
+                return "torch.float16"
+            return "torch.bfloat16"
+
+        mask = (
+            (
+                df["act_type"]
+                .astype(str)
+                .isin([str(ActivationType.Silu), str(ActivationType.Swiglu)])
+            )
+            & (df["q_type"].astype(str) == str(QuantType.per_1x32))
+            & (df["q_dtype_w"].astype(str) == str(dtypes.fp4x2))
+            & (df["use_g1u1"].apply(_as_int) == 1)
+            & (df["doweight_stage1"].apply(_as_int) == 0)
+        )
+        if not mask.any():
+            return df
+
+        expanded = [df[~mask]]
+        for _, row in df[mask].iterrows():
+            for q_dtype_a in (_base_activation_dtype(row["dtype"]), str(dtypes.fp4x2)):
+                candidate = row.copy()
+                candidate["q_dtype_a"] = q_dtype_a
+                expanded.append(candidate.to_frame().T)
+
+        expanded_df = pd.concat(expanded, ignore_index=True)
+        return expanded_df.drop_duplicates(keep="last")
+
+    def _select_best_mxfp4_dtype_rows(self, df):
+        """Keep only the fastest activation dtype row for each MXFP4 MoE shape."""
+        if df is None or df.empty:
+            return df
+
+        required = {
+            "act_type",
+            "q_dtype_w",
+            "q_type",
+            "use_g1u1",
+            "doweight_stage1",
+            "us",
+            "q_dtype_a",
+        }
+        if not required.issubset(df.columns):
+            return df
+
+        def _as_int(value):
+            return int(float(value))
+
+        df = df.copy()
+        mask = (
+            (
+                df["act_type"]
+                .astype(str)
+                .isin([str(ActivationType.Silu), str(ActivationType.Swiglu)])
+            )
+            & (df["q_type"].astype(str) == str(QuantType.per_1x32))
+            & (df["q_dtype_w"].astype(str) == str(dtypes.fp4x2))
+            & (
+                df["q_dtype_a"]
+                .astype(str)
+                .isin([str(dtypes.bf16), str(dtypes.fp16), str(dtypes.fp4x2)])
+            )
+            & (df["use_g1u1"].apply(_as_int) == 1)
+            & (df["doweight_stage1"].apply(_as_int) == 0)
+        )
+        if not mask.any():
+            return df
+
+        dtype_group_keys = [col for col in self.keys if col != "q_dtype_a"]
+        if "_tag" in df.columns:
+            dtype_group_keys.append("_tag")
+
+        selected = (
+            df[mask]
+            .assign(_total_us=pd.to_numeric(df.loc[mask, "us"], errors="coerce"))
+            .sort_values("_total_us", kind="stable")
+            .drop_duplicates(subset=dtype_group_keys, keep="first")
+            .drop(columns=["_total_us"])
+        )
+        return pd.concat([df[~mask], selected], ignore_index=True)
 
     @staticmethod
     def weight_quant(
@@ -329,13 +431,14 @@ class FmoeTuner(TunerCommon):
 
     @staticmethod
     def cktile_moe_stage1_out(
-        a1_fp8,
+        a1,
         w1_qt_shffle_ck,
         w2_qt_shffle_ck,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
+        topk_ids,
         w1_scale_aiter,
         bias,
         dtype,
@@ -344,12 +447,16 @@ class FmoeTuner(TunerCommon):
         act_type,
     ):
         M_sorted = sorted_ids.shape[0]
-        model_dim = a1_fp8.shape[1]
-        a1_scale = torch.ones(
-            (M_sorted, model_dim // 32), dtype=dtypes.fp8_e8m0, device=a1_fp8.device
+        model_dim = a1.shape[1]
+        a1_scale = (
+            torch.ones(
+                (M_sorted, model_dim // 32), dtype=dtypes.fp8_e8m0, device=a1.device
+            )
+            if a1.dtype == dtypes.fp8
+            else None
         )
         return cktile_moe_stage1(
-            a1_fp8,
+            a1,
             w1_qt_shffle_ck,
             w2_qt_shffle_ck,
             sorted_ids,
@@ -362,9 +469,11 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale_aiter.view(dtypes.fp8_e8m0),
             sorted_weights=sorted_weights,
             bias1=bias,
+            topk_ids=topk_ids,
             activation=act_type,
-            split_k=1,
+            split_k=1 if a1.dtype == dtypes.fp8 else 2,
             dtype=dtype,
+            post_activation_layout="auto" if a1.dtype == dtypes.fp8 else "standard",
         )
 
     @staticmethod
@@ -1069,7 +1178,7 @@ class FmoeTuner(TunerCommon):
                     if (
                         act_type == ActivationType.Swiglu
                         and q_type == QuantType.per_1x32
-                        and q_dtype_a == dtypes.fp8
+                        and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                         and dtype in [dtypes.bf16, dtypes.fp16]
                     )
                     else None
@@ -1135,6 +1244,14 @@ class FmoeTuner(TunerCommon):
                 a2_scale_mxfp4_sort = torch.ones(
                     [M, N // 32], dtype=dtypes.fp8_e8m0, device=a2_qt.device
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                a2_qt = ref1.to(dtype)
+                a2_scale = None
+                a2_scale_mxfp4_sort = None
             else:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
@@ -1175,7 +1292,7 @@ class FmoeTuner(TunerCommon):
                     if (
                         act_type == ActivationType.Swiglu
                         and q_type == QuantType.per_1x32
-                        and q_dtype_a == dtypes.fp8
+                        and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                         and dtype in [dtypes.bf16, dtypes.fp16]
                     )
                     else None
@@ -2122,16 +2239,23 @@ class FmoeTuner(TunerCommon):
             and q_dtype_w == dtypes.fp4x2
             and q_type == QuantType.per_1x32
         )
+        _is_bf16_wfp4_cktile = (
+            act_type in [ActivationType.Silu, ActivationType.Swiglu]
+            and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+            and q_dtype_w == dtypes.fp4x2
+            and q_type == QuantType.per_1x32
+        )
 
-        if _is_a8w4:
+        if _is_a8w4 or _is_bf16_wfp4_cktile:
             return self._gen_2stages_task_cktile(info, blockMs)
 
         # CK kernels don't support a16wi4 (per_1x32 + i4x2); skip to FlyDSL path
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
-        # CK2stages codegen does not support SwiGLU activation. GPT-OSS MXFP4
-        # cases are covered by FlyDSL (or the a8w4 CK-Tile path above).
+        # CK2stages codegen does not support SwiGLU activation. SwiGLU MXFP4
+        # cases are covered by FlyDSL (or the a8w4/a16w4 CK-Tile paths above).
+        # Silu fp4/fp4 a4w4 is supported by CK2stages and should still compete.
         if (
             act_type == ActivationType.Swiglu
             and q_type == QuantType.per_1x32
@@ -2290,7 +2414,7 @@ class FmoeTuner(TunerCommon):
         return tasks_ck
 
     def _gen_2stages_task_cktile(self, info, blockMs):
-        """A8W4 (fp8 activation + fp4 weight + per_1x32) uses cktile path."""
+        """CK-Tile path for fp4 weights with fp8 or bf16/fp16 activations."""
         tasks_ck = []
         (
             cu_num,
@@ -2338,10 +2462,14 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64] or not use_g1u1:
+            if blockM not in [16, 32, 64] or not use_g1u1:
                 continue
 
-            cktile_s1_name = f"cktile_a8w4_bm{blockM}"
+            cktile_tag = (
+                "a8w4" if q_dtype_a == dtypes.fp8 else f"a{dtype2str_dict[q_dtype_a]}w4"
+            )
+            cktile_s1_name = f"cktile_{cktile_tag}_bm{blockM}"
+            s1_input_idx = 20 if q_dtype_a == dtypes.fp8 else 0
             tasks_ck.append(
                 (
                     (info, "stage1", cktile_s1_name, blockM),
@@ -2349,7 +2477,7 @@ class FmoeTuner(TunerCommon):
                     (*_gen_data_args_s1, blockM, 1),
                     FmoeTuner.cktile_moe_stage1_out,
                     (
-                        [20, 1, 2, 5, 6, 7, 8, 15, 22],
+                        [s1_input_idx, 1, 2, 5, 6, 7, 8, 13, 15, 22],
                         dtype,
                         topk,
                         blockM,
@@ -2374,7 +2502,12 @@ class FmoeTuner(TunerCommon):
                 )
             )
 
-            cktile_s2_name = f"cktile_a8w4_bm{blockM}"
+            cktile_s2_name = f"cktile_{cktile_tag}_bm{blockM}"
+            s2_ref_args = (
+                ([20, 10, 11, 12, 13, 21, 4, 22], dtype, q_type, doweight_stage1)
+                if q_dtype_a == dtypes.fp8
+                else ([0, 10, 11, 12, 13, 3, 4, 22], dtype, q_type, doweight_stage1)
+            )
             tasks_ck.append(
                 (
                     (info, "stage2", cktile_s2_name, blockM),
@@ -2390,12 +2523,7 @@ class FmoeTuner(TunerCommon):
                     ),
                     {},
                     FmoeTuner.run_torch_moe_stage2,
-                    (
-                        [20, 10, 11, 12, 13, 21, 4, 22],
-                        dtype,
-                        q_type,
-                        doweight_stage1,
-                    ),
+                    s2_ref_args,
                     {},
                     (None),
                     0.01,
@@ -2427,6 +2555,13 @@ class FmoeTuner(TunerCommon):
         ) = info
 
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
+            return tasks_flydsl
+        if (
+            act_type in [ActivationType.Silu, ActivationType.Swiglu]
+            and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        ):
+            # Generic MXFP4 a16w4 is covered by CK-Tile. The FlyDSL fp16/fp4
+            # kernels use a different path and should not compete with it.
             return tasks_flydsl
 
         _a_dtype_map = {
@@ -3210,6 +3345,7 @@ class FmoeTuner(TunerCommon):
         if len(kept_old_fb) > 0:
             resultdf = pd.concat([resultdf, kept_old_fb], ignore_index=True)
 
+        resultdf = self._select_best_mxfp4_dtype_rows(resultdf)
         resultdf = resultdf.astype(str).drop_duplicates(
             subset=self.keys + ["_tag"], keep="last"
         )
@@ -3639,7 +3775,7 @@ class FmoeTuner(TunerCommon):
             profile_result = pd.concat([old_profile, profile_result])
             profile_result.to_csv(profile_file, index=False)
         if len(bests) > 0:
-            return pd.concat(bests, axis=1).T
+            return self._select_best_mxfp4_dtype_rows(pd.concat(bests, axis=1).T)
         else:
             return pd.DataFrame()
 
@@ -3659,7 +3795,9 @@ class FmoeTuner(TunerCommon):
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
 
-            elif self.tunedf is not None:
+            self.untunedf = self._expand_mxfp4_dtype_candidates(self.untunedf)
+
+            if not args.last and self.tunedf is not None:
                 untunedf_cols = self.untunedf.columns
                 mask = self.untunedf.apply(tuple, axis=1).isin(
                     self.tunedf[untunedf_cols].apply(tuple, axis=1)

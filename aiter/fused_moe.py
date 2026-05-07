@@ -26,7 +26,6 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
     os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
 )
-_SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
 
 def _moe_sorting_impl(
@@ -298,7 +297,33 @@ def fused_moe_(
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+            q_dtype_a = _get_tuned_mxfp4_q_dtype_a(
+                get_padded_M(M),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                dtype,
+                q_dtype_w,
+                quant_type,
+                isG1U1,
+                activation,
+                doweight_stage1,
+            ) or (dtypes.bf16 if M < 256 else dtypes.fp4x2)
+        elif activation == ActivationType.Silu and q_dtype_w == dtypes.fp4x2:
+            q_dtype_a = _get_tuned_mxfp4_q_dtype_a(
+                get_padded_M(M),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                dtype,
+                q_dtype_w,
+                quant_type,
+                isG1U1,
+                activation,
+                doweight_stage1,
+            ) or (dtypes.bf16 if M < 256 else dtypes.fp4x2)
         elif activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
@@ -654,6 +679,75 @@ def get_padded_M(M):
     else:
         padded_m = 32768
     return padded_m
+
+
+@functools.lru_cache(maxsize=2048)
+def _get_tuned_mxfp4_q_dtype_a(
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    dtype,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    doweight_stage1,
+):
+    """Pick the activation dtype from the tuned MXFP4 MoE row."""
+    import csv
+
+    tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    if not os.path.exists(tune_file):
+        return None
+
+    candidates = {
+        "torch.bfloat16": dtypes.bf16,
+        "torch.float16": dtypes.fp16,
+        "torch.float4_e2m1fn_x2": dtypes.fp4x2,
+    }
+    best = None
+
+    def _as_int(value):
+        return int(float(value))
+
+    def _as_us(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    cu_num = get_cu_num()
+    with open(tune_file, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("_tag", ""):
+                continue
+            q_dtype_a = row.get("q_dtype_a")
+            if q_dtype_a not in candidates:
+                continue
+            if (
+                _as_int(row["cu_num"]) != cu_num
+                or _as_int(row["token"]) != token
+                or _as_int(row["model_dim"]) != model_dim
+                or _as_int(row["inter_dim"]) != inter_dim
+                or _as_int(row["expert"]) != expert
+                or _as_int(row["topk"]) != topk
+                or row.get("act_type") != str(activation)
+                or row.get("dtype") != str(dtype)
+                or row.get("q_dtype_w") != str(q_dtype_w)
+                or row.get("q_type") != str(q_type)
+                or _as_int(row["use_g1u1"]) != int(use_g1u1)
+                or _as_int(row["doweight_stage1"]) != int(doweight_stage1)
+            ):
+                continue
+            total_us = _as_us(row.get("us"), None)
+            if total_us is None:
+                total_us = _as_us(row.get("us1")) + _as_us(row.get("us2"))
+            if best is None or total_us < best[0]:
+                best = (total_us, q_dtype_a)
+
+    return candidates.get(best[1]) if best is not None else None
 
 
 @dataclass
@@ -1103,9 +1197,9 @@ def get_2stage_cfgs(
             has_bias=True,
             stage2_has_bias=True,
         )
-    swiglu_mxfp4_bf16_cktile = (
+    mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and activation in [ActivationType.Silu, ActivationType.Swiglu]
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
@@ -1229,16 +1323,17 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
+        and q_dtype_a != dtypes.fp4x2
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
-        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
+        and (ksplit > 1 or mxfp4_bf16_cktile)
     ):
-        # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
+        # Generic MXFP4 MoE can use bf16/fp16 activations for small batches while
         # keeping the generic preshuffled fp4 weights. CK2stages has no
         # heuristic kernel for that A16W4 combination, so use CK-Tile.
         # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
         # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
-        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
+        _min_split_k = 2 if mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
@@ -1249,9 +1344,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 split_k=_split_k,
                 dtype=dtype,
-                post_activation_layout=(
-                    "standard" if swiglu_mxfp4_bf16_cktile else "auto"
-                ),
+                post_activation_layout="standard" if mxfp4_bf16_cktile else "auto",
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1395,7 +1488,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
+            and activation in [ActivationType.Silu, ActivationType.Swiglu]
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1516,7 +1609,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
+            and activation in [ActivationType.Silu, ActivationType.Swiglu]
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
