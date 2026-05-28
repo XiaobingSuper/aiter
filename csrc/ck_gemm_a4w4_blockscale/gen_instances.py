@@ -267,14 +267,17 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         df = pd.read_csv(tune_dict_csv)
-        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
+        # The a4w4 tuned CSV mixes CK, ASM, and Triton kernels in one file with
         # no libtype column.  The Python dispatcher in
-        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
-        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
-        # apply the same filter here so the CK codegen sees only CK rows and
-        # build_tune_dict's strict validation stays effective on genuine CK
-        # references.
-        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
+        # aiter/ops/gemm_op_a4w4.py routes non-CK rows before calling the CK
+        # module; apply the same filter here so CK codegen sees only CK rows
+        # and build_tune_dict's strict validation stays effective on genuine
+        # CK references.
+        kernel_names = df["kernelName"].astype(str)
+        non_ck = kernel_names.str.startswith("_ZN") | kernel_names.eq(
+            "triton_gemm_afp4wfp4_preshuffle"
+        )
+        df = df[~non_ck]
         return build_tune_dict(
             df,
             default_kernels_dict,

@@ -20,6 +20,7 @@ torch.set_printoptions(sci_mode=False)
 torch.random.manual_seed(0)
 SCALE_GROUP_SIZE = 32
 block_shape = (128, 128)
+TRITON_A4W4_PRESHUFFLE_KERNEL_NAME = "triton_gemm_afp4wfp4_preshuffle"
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -100,17 +101,49 @@ def run_gemm_a4w4_blockscale_asm(
     return res[:m]
 
 
+def run_gemm_a4w4_blockscale_triton(
+    x,
+    weight_shuffle,
+    x_scale,
+    w_scale,
+    out,
+    dtype=dtypes.bf16,
+):
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+    m, _ = x.shape
+    n = out.shape[1]
+    weight_shuffle = weight_shuffle.view(torch.uint8).view(n // 16, -1)
+    if m < 32:
+        x_scale = x_scale[:m].view(torch.uint8)
+    else:
+        x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+    w_scale = w_scale.view(torch.uint8).view(w_scale.shape[0] // 32, -1)
+    res = gemm_afp4wfp4_preshuffle(
+        x.view(torch.uint8),
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        dtype=dtype,
+        y=out,
+    )
+    return res[:m]
+
+
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     torch.manual_seed(seed)
-    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((m, k), dtype=dtype, device=device)  #
-    w = torch.randn((n, k), dtype=dtype, device=device)  #
-    _, x_scales = quant_func(x, shuffle=False)
-    _, w_scales = quant_func(w, shuffle=False)
-    x, x_scales_shuffle = quant_func(x, shuffle=True)
-    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+    x_bf16 = torch.randn((m, k), dtype=dtype, device=device)  #
+    w_bf16 = torch.randn((n, k), dtype=dtype, device=device)  #
+    x, x_scales = quant_func(x_bf16, quant_dtype=dtypes.fp4x2, shuffle=False)
+    _, x_scales_shuffle = quant_func(
+        x_bf16, quant_dtype=dtypes.fp4x2, shuffle=True
+    )
+    w, w_scales = quant_func(w_bf16, quant_dtype=dtypes.fp4x2, shuffle=False)
     w_shuffle = shuffle_weight(w)
+    w_scales_shuffle = fp4_utils.e8m0_shuffle(w_scales)
     out_ck = torch.empty((m + 255) // 256 * 256, n, dtype=dtype, device=device)
+    out_gemm = torch.empty((m + 31) // 32 * 32, n, dtype=dtype, device=device)
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     bias_f32 = None
@@ -123,6 +156,7 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
         "x_scales_shuffle": x_scales_shuffle,
         "w_scales_shuffle": w_scales_shuffle,
         "out_ck": out_ck,
+        "out_gemm": out_gemm,
         "bias_f32": bias_f32,
     }
 
@@ -146,7 +180,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         pass
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4, get_gemm_a4w4_backend
         from aiter.test_common import run_perftest, checkAllclose
 
         untunedf = self.untunedf
@@ -167,14 +201,20 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 w_shuffle = gd["w_shuffle"]
                 x_scales_shuffle = gd["x_scales_shuffle"]
                 w_scales_shuffle = gd["w_scales_shuffle"]
+                x_scales_gemm = (
+                    x_scales
+                    if get_gemm_a4w4_backend(M, N, K) == "triton" and M < 32
+                    else x_scales_shuffle
+                )
                 out, us = run_perftest(
                     gemm_a4w4,
                     x,
                     w_shuffle,
-                    x_scales_shuffle,
+                    x_scales_gemm,
                     w_scales_shuffle,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
+                    num_rotate_args=1,
                 )
                 ref = run_torch(x, w, x_scales, w_scales, dtypes.bf16)
                 err_ratio = checkAllclose(
@@ -253,7 +293,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             "w_shuffle",
             "x_scales_shuffle",
             "w_scales_shuffle",
-            "out_ck",
+            "out_gemm",
             "bias_f32",
         ]
         ref_keys = ["x", "w", "x_scales", "w_scales"]
@@ -295,6 +335,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             {
                                 "num_warmup": 10,
                                 "num_iters": 101,
+                                "num_rotate_args": 1,
                             },
                             run_torch,
                             (
@@ -311,6 +352,51 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
+            if N % 32 == 0 and K % 256 == 0:
+                gemm_triton_keys = [
+                    "x",
+                    "w_shuffle",
+                    "x_scales" if M < 32 else "x_scales_shuffle",
+                    "w_scales_shuffle",
+                    "out_gemm",
+                ]
+                triton_kernel_id = ck_kernels_num
+                info = (
+                    (gfx, cu_num, M, N, K),
+                    triton_kernel_id,
+                    0,
+                    TRITON_A4W4_PRESHUFFLE_KERNEL_NAME,
+                )
+                task.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed),
+                        run_gemm_a4w4_blockscale_triton,
+                        (
+                            gemm_triton_keys,
+                            dtypes.bf16,
+                        ),
+                        {
+                            "num_warmup": 10,
+                            "num_iters": 101,
+                            "num_rotate_args": 1,
+                        },
+                        run_torch,
+                        (
+                            ref_keys,
+                            dtypes.bf16,
+                        ),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                        None,
+                        None,
+                        ("out_gemm",),
+                    )
+                )
+                total_kernel_nums = total_kernel_nums + 1
             ### asm kernels
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
@@ -348,6 +434,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             {
                                 "num_warmup": 10,
                                 "num_iters": 101,
+                                "num_rotate_args": 1,
                             },
                             run_torch,
                             (
@@ -360,7 +447,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             0.01,
                             None,
                             None,
-                            ("out_ck",),
+                            ("out_gemm",),
                         )
                     )
                     asm_kernels_id = asm_kernels_id + 1

@@ -15,6 +15,8 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
+TRITON_A4W4_PRESHUFFLE_KERNEL_NAME = "triton_gemm_afp4wfp4_preshuffle"
+
 
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
@@ -77,6 +79,18 @@ def get_GEMM_config(M: int, N: int, K: int):
     return config
 
 
+def get_gemm_a4w4_backend(M: int, N: int, K: int) -> str:
+    config = get_GEMM_config(M, N, K)
+    if config is None:
+        return "asm"
+    kernel_name = config.get("kernelName", "")
+    if kernel_name == TRITON_A4W4_PRESHUFFLE_KERNEL_NAME:
+        return "triton"
+    if "_ZN" in kernel_name:
+        return "asm"
+    return "ck"
+
+
 def gemm_a4w4_fake(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
@@ -128,6 +142,28 @@ def gemm_a4w4(
     if ck_config is not None:
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
+    if kernelName == TRITON_A4W4_PRESHUFFLE_KERNEL_NAME:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+        if n % 32 != 0 or k % 256 != 0:
+            raise RuntimeError(
+                f"{TRITON_A4W4_PRESHUFFLE_KERNEL_NAME} requires N % 32 == 0 "
+                "and K % 256 == 0."
+            )
+        B_triton = B.view(torch.uint8).view(n // 16, -1)
+        if m < 32:
+            A_scale_triton = A_scale[:m].view(torch.uint8)
+        else:
+            A_scale_triton = A_scale.view(torch.uint8).view(A_scale.shape[0] // 32, -1)
+        B_scale_triton = B_scale.view(torch.uint8).view(B_scale.shape[0] // 32, -1)
+        return gemm_afp4wfp4_preshuffle(
+            A.view(m, k // 2).view(torch.uint8),
+            B_triton,
+            A_scale_triton,
+            B_scale_triton,
+            dtype=dtype,
+            y=out,
+        )[:m].view(*A.shape[:-1], n)
     if (
         ck_config is not None
         and kernelName.find("_ZN") == -1
