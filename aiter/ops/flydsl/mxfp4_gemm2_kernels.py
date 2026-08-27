@@ -3,6 +3,7 @@
 
 
 import functools
+import os
 
 import torch
 
@@ -21,6 +22,19 @@ _SUPPORTED = {
     (64, False, "nonatomic_cshuffle"),
     (128, False, "nonatomic_cshuffle"),
 }
+
+
+def mxfp4_out_enabled(BM, D_HIDDEN, D_INTER, NE):
+    """Whether the `_f4out` stage-2 epilog will actually run for this shape.
+
+    It quantizes the stage-2 output to 4 bits before the topk sum, which is
+    lossy, so it is opt-in and only wired up for one shape family. Callers that
+    ask for it anywhere else get the plain bf16 epilog instead -- keep this the
+    single definition of that condition so the tuner, the AOT pre-compile and
+    the runtime cannot drift apart.
+    """
+    shape_ok = BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
+    return shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
 
 
 def _epilog_of(atomic, mxfp4out, cshuffle=False):

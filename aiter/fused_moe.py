@@ -1700,12 +1700,10 @@ def _mxfp4_a4w4_stage2(
     if atomic:
         out_buf = out_dst
     else:
-        _mx_shape_ok = (
-            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
-        )
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import mxfp4_out_enabled
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
-        if _mx_shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1":
+        if mxfp4_out_enabled(BM, D_HIDDEN, D_INTER, NE):
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
             )

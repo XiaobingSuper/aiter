@@ -6125,7 +6125,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def _candidate_rows(self, row):
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
-        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import (
+            _SUPPORTED as G2,
+            mxfp4_out_enabled,
+        )
+
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        d_inter = ((inter_dim + 255) // 256) * 256
+        expert = int(row["expert"])
 
         g2_bms = {v[0] for v in G2}
         cands = []
@@ -6135,6 +6143,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
                 if bm in g2_bms:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                        # _f4out degrades to the plain epilog unless the shape
+                        # and the opt-in env both allow it. Tuning it anyway
+                        # just times the plain kernel twice and can record a
+                        # name the runtime will not honour.
+                        if ep == "nonatomic_mxfp4" and not mxfp4_out_enabled(
+                            bm, model_dim, d_inter, expert
+                        ):
+                            continue
                         cands.append(
                             self._candidate_row(
                                 row, bm, kn1, self._g2_kname(bm, n2, ep)
