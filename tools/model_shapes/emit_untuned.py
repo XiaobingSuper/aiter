@@ -17,9 +17,9 @@ import glob
 import json
 from pathlib import Path
 
-# M values to sweep per scenario, on top of whatever was observed at runtime.
+# The collector reads weight shapes at construction, so M is not observed:
+# every scenario supplies its own sweep. Pick by how the model will be served.
 SCENARIOS: dict[str, list[int]] = {
-    "observed": [],
     "decode": [1, 2, 4, 8, 16, 32, 64, 128, 256],
     "throughput": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
     "prefill": [512, 1024, 2048, 4096, 8192, 16384],
@@ -74,7 +74,6 @@ GEMM_ROUTES: dict[str, tuple[str, str, dict]] = {
 }
 
 MOE_COLS = [
-    "token",
     "model_dim",
     "inter_dim",
     "expert",
@@ -112,15 +111,12 @@ def dedup(rows: list[Row]) -> list[Row]:
     return out
 
 
-def expand_m(rows: list[Row], m_col: str, sweep: list[int]) -> list[Row]:
-    """Cross every distinct weight shape with the scenario's M sweep."""
-    if not sweep:
-        return rows
-    out = list(rows)
-    for row in rows:
-        for m in sweep:
-            out.append({**row, m_col: m})
-    return dedup(out)
+def with_m(rows: list[Row], m_col: str, sweep: list[int]) -> list[Row]:
+    """Cross every distinct weight shape with the scenario's M sweep.
+
+    m_col goes first so the emitted column order matches aiter's untuned CSVs.
+    """
+    return dedup([{m_col: m, **row} for row in rows for m in sweep])
 
 
 def drop_tuned(rows: list[Row], tuned: Path) -> tuple[list[Row], int]:
@@ -163,7 +159,6 @@ def emit_gemm(records: list[Row], out: Path, sweep: list[int], append: bool) -> 
         untuned_name, tuned_name, extra = route
         rows = [
             {
-                "M": rec["M"],
                 "N": rec["N"],
                 "K": rec["K"],
                 **{
@@ -173,7 +168,7 @@ def emit_gemm(records: list[Row], out: Path, sweep: list[int], append: bool) -> 
             }
             for rec in group
         ]
-        rows = expand_m(dedup(rows), "M", sweep)
+        rows = with_m(dedup(rows), "M", sweep)
         rows, skipped = drop_tuned(rows, out / tuned_name)
         write(rows, out / untuned_name, append)
         print(f"{untuned_name}: +{len(rows)} shapes ({skipped} already tuned)")
@@ -188,7 +183,7 @@ def emit_moe(records: list[Row], out: Path, sweep: list[int], append: bool) -> N
     for grouped, group in sorted(groups.items()):
         cols = MOE_COLS + (["gate_mode"] if grouped else [])
         rows = dedup([{c: rec[c] for c in cols} for rec in group])
-        rows = expand_m(rows, "token", sweep)
+        rows = with_m(rows, "token", sweep)
         name = "untuned_grouped_fmoe.csv" if grouped else "untuned_fmoe.csv"
         tuned = "tuned_grouped_fmoe.csv" if grouped else "tuned_fmoe.csv"
         rows, skipped = drop_tuned(rows, out / tuned)
@@ -202,7 +197,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("records", nargs="+", help="jsonl files from collector.py")
     ap.add_argument("--out", default=Path("aiter/configs"), type=Path)
-    ap.add_argument("--scenario", default="observed", choices=sorted(SCENARIOS))
+    ap.add_argument("--scenario", default="throughput", choices=sorted(SCENARIOS))
     ap.add_argument(
         "--append",
         action="store_true",

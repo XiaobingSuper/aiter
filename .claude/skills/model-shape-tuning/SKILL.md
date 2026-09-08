@@ -30,35 +30,36 @@ differ per TP/EP and tuning the wrong config is wasted GPU time.
 
 ## Step 1 — collect
 
-Take the recipe's command and add three things: the two env vars, `--load_dummy`
-and `--enforce-eager`.
+Take the recipe's command and add the collector env vars plus `--load_dummy`.
+No requests are needed — shapes are read from the built model before warmup.
 
 ```bash
 ATOM_SHAPE_DUMP=/tmp/<model>_shapes.jsonl \
 PYTHONPATH=$AITER/tools/model_shapes:$PYTHONPATH \
 <recipe env vars> \
 python -m atom.entrypoints.openai_server --model <path> \
-    <recipe flags> --load_dummy --enforce-eager
+    <recipe flags> --load_dummy=xavier --enforce-eager
 ```
 
 Some recipes set `PYTHONPATH` themselves — append to it, never overwrite, or the
 hooks never load in the spawned ranks.
 
-- `--load_dummy` skips weight loading. Shapes come from the config, not the
-  values, so dummy weights are always correct here and save minutes per run.
-- `--enforce-eager` is required: captured graphs hide the calls from the hooks.
-- Drive both regimes before shutting down — one long prefill request and a few
-  decode steps — or the M coverage will be one-sided.
-- Shut down with SIGINT so `atexit` writes the dump. Each rank writes
-  `<name>.rank<N>.jsonl`.
+- `--load_dummy=xavier` skips reading the checkpoint; shapes come from the
+  config. Use `=xavier`, not the bare flag: online quantization needs finite
+  values to compute scales.
+- Wait for `walked <n> layers` from every rank (`ATOM_SHAPE_DEBUG=1` prints it),
+  then stop the server. Waiting for the server to be ready is not required.
+- Stop it with `pkill -f "[o]penai_server"` — plain `pkill -f openai_server`
+  matches the shell running it and kills that instead.
 
-The collector patches `LinearBase.forward` (every dense GEMM in ATOM dispatches
-there) and `aiter.fused_moe`. Nothing needs to be modelled about parallelism:
-`input_size`/`output_size` are already per-partition and `w1`/`w2` already hold
-the local expert count.
+The collector walks the built model once, just before `ModelRunner.warmup_model`.
+Do not move this earlier or later, and never into a forward: ATOM compiles the
+model as one graph whose backend asserts a single call, so a forward hook kills
+the engine with "VllmBackend can only be called once", while reading at layer
+construction misses the quant_type that online quantization rewrites afterwards.
 
-If the run prints nothing and the dump is empty, the hooks did not attach —
-check that `collector` was imported before ATOM and that eager mode is on.
+Nothing about parallelism needs modelling: `input_size`/`output_size` are
+per-partition and `local_num_experts` is post-EP.
 
 ## Step 2 — emit
 
@@ -67,8 +68,8 @@ python3 tools/model_shapes/emit_untuned.py '/tmp/<model>_shapes.rank*.jsonl' \
     --out aiter/configs --scenario throughput --append
 ```
 
-Scenarios (`observed`, `decode`, `prefill`, `throughput`) add an M sweep on top
-of the observed shapes; pick by how the model will be served. Shapes already in
+Scenarios (`decode`, `prefill`, `throughput`) supply the M sweep — M is not
+collected, so pick the one matching how the model will be served. Shapes already in
 the matching tuned CSV are dropped, so only genuinely new work is queued.
 
 Report the per-file counts it prints. **Investigate any `[skip] unrouted
@@ -100,9 +101,10 @@ everyone after two PRs land.
 ## Checklist
 
 - [ ] launch line taken from `ATOM/recipes/<Model>.md`, env vars included
-- [ ] collected with `--load_dummy --enforce-eager`, both prefill and decode driven
+- [ ] collected with `--load_dummy=xavier`; every rank logged `walked <n> layers`
 - [ ] every rank's dump fed to `emit_untuned.py`
 - [ ] no unrouted-kernel warnings left unexplained
 - [ ] empty MoE records reconciled against the recipe's MoE backend
+- [ ] `python3 tools/model_shapes/test_collector.py` passes if the tool was touched
 - [ ] GEMM tuners ran with `--shape_grouped`
 - [ ] configs landed per `aiter-config-shape`
