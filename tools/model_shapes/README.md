@@ -8,6 +8,12 @@ per-partition, and `fused_moe`'s `w1`/`w2` already hold the local expert count.
 
 ## 1. collect
 
+Start from `ATOM/recipes/<Model>.md` — it holds the launch command the model is
+actually served with, env vars included. Those env vars select kernel paths, so
+collecting without them yields shapes the deployment never issues. Notably
+`ATOM_USE_TRITON_MOE=1` sends MoE through triton, in which case zero MoE records
+is the correct outcome.
+
 ```bash
 ATOM_SHAPE_DUMP=/tmp/shapes.jsonl \
 PYTHONPATH=$AITER/tools/model_shapes:$PYTHONPATH \

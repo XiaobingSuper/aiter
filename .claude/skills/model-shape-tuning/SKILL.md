@@ -11,20 +11,38 @@ Three steps: **collect → emit → tune**. Tooling lives in
 splitting, MoE local expert counts and quant dtypes are all easy to get wrong by
 hand, and a wrong shape costs a full tuning run.
 
-## What the user must supply
+## Step 0 — start from the recipe
 
-Model path and the parallel config to tune for (`--tp`, `--ep`, and whether DP
-attention is on). Everything else is derived. If the parallel config is not
-given, ask — shapes differ per TP/EP and tuning the wrong one is wasted GPU time.
+`ATOM/recipes/<Model>.md` carries the launch command the model is actually
+served with: parallel config, quant flags and the env vars. **Read it first and
+reuse that command verbatim** — do not invent a launch line, and do not drop its
+env vars. They are not cosmetic; they select kernel paths, and collecting under
+a different launch line yields shapes the deployment never issues.
+
+The one that bites hardest: `ATOM_USE_TRITON_MOE=1` (required by e.g.
+DeepSeek-V4-Pro) routes MoE through triton, so `aiter.fused_moe` is never called.
+For such a model, collecting **zero MoE records is the correct result** — do not
+"fix" it, and do not tune `untuned_fmoe.csv`. Others like `ATOM_MOE_GU_ITLV` and
+`AITER_BF16_FP8_MOE_BOUND` likewise change what gets issued.
+
+If no recipe exists for the model, ask the user for the launch command — shapes
+differ per TP/EP and tuning the wrong config is wasted GPU time.
 
 ## Step 1 — collect
+
+Take the recipe's command and add three things: the two env vars, `--load_dummy`
+and `--enforce-eager`.
 
 ```bash
 ATOM_SHAPE_DUMP=/tmp/<model>_shapes.jsonl \
 PYTHONPATH=$AITER/tools/model_shapes:$PYTHONPATH \
-python -m atom.entrypoints.api_server --model <path> \
-    --tp 8 --ep 8 --load_dummy --enforce-eager
+<recipe env vars> \
+python -m atom.entrypoints.openai_server --model <path> \
+    <recipe flags> --load_dummy --enforce-eager
 ```
+
+Some recipes set `PYTHONPATH` themselves — append to it, never overwrite, or the
+hooks never load in the spawned ranks.
 
 - `--load_dummy` skips weight loading. Shapes come from the config, not the
   values, so dummy weights are always correct here and save minutes per run.
@@ -81,9 +99,10 @@ everyone after two PRs land.
 
 ## Checklist
 
-- [ ] parallel config confirmed with the user
+- [ ] launch line taken from `ATOM/recipes/<Model>.md`, env vars included
 - [ ] collected with `--load_dummy --enforce-eager`, both prefill and decode driven
 - [ ] every rank's dump fed to `emit_untuned.py`
 - [ ] no unrouted-kernel warnings left unexplained
+- [ ] empty MoE records reconciled against the recipe's MoE backend
 - [ ] GEMM tuners ran with `--shape_grouped`
 - [ ] configs landed per `aiter-config-shape`
