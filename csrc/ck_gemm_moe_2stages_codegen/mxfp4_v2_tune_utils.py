@@ -351,7 +351,7 @@ def gen(
             sorted_ids=sorted_ids,
             num_valid_ids=num_valid_ids,
             token_num=token,
-            block_size=block_m,
+            block_size=max(32, block_m),
         ),
         "a2_qt": None,
         "a2_scale": None,
@@ -542,7 +542,7 @@ def populate_baseline_v2_intermediate(
         sorted_ids=v["sti"],
         num_valid_ids=v["cumsum"],
         token_num=token,
-        block_size=BM_S1,
+        block_size=max(32, BM_S1),
     )
     adtype = d["base"].get("adtype", "fp8")
     b_dtype = d.get("b_dtype", "fp4")

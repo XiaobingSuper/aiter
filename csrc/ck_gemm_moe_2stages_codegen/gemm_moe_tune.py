@@ -964,7 +964,7 @@ class FmoeTuner(TunerCommon):
             sorted_ids=v["sti"],
             num_valid_ids=v["cumsum"],
             token_num=token,
-            block_size=blockM,
+            block_size=max(32, blockM),
         )
         # The a8w4 a_scale_one=True variant uses an unscaled bf16->fp8 cast.
         # The a8w8 path uses the real per-1x32 payload and E8M0 scale instead.
@@ -1141,6 +1141,7 @@ class FmoeTuner(TunerCommon):
             epilog=epilog,
             SBM=sbm,
             persist=kparams["persist"],
+            g2_bf16_lds=kparams.get("bf16_lds"),
             n_sorted_padded=n,
         )
         if epilog == "reduce":
@@ -3846,7 +3847,9 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in (32, 64, 128):
+            if blockM not in (32, 64, 128) and not (
+                blockM == 16 and adtype == "fp8" and bdtype == "fp8"
+            ):
                 continue
             # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
             # Mirror gen_flydsl_2stages_task's fused-variant construction so

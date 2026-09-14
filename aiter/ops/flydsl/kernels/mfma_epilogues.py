@@ -118,7 +118,10 @@ def c_shuffle_epilog(
         raise ValueError(
             f"block_size ({block_size}) must be divisible by cshuffle_nlane ({cshuffle_nlane})"
         )
-    cshuffle_mlane = int(block_size) // int(cshuffle_nlane)
+    # K partitioning can launch more threads than the output tile needs.
+    # All waves participate in the write/barriers; only the first complete
+    # set of output lanes performs the read/store phase.
+    cshuffle_mlane = min(int(block_size) // int(cshuffle_nlane), int(tile_m))
     if (int(tile_m) % cshuffle_mlane) != 0:
         raise ValueError(
             f"tile_m must be divisible by CShuffleMLane ({cshuffle_mlane}), got tile_m={tile_m}"
@@ -341,6 +344,8 @@ def c_shuffle_epilog(
 
     c_nlane = fx.Index(CShuffleNLane)
     m_lane = tx // c_nlane
+    if cshuffle_mlane * int(cshuffle_nlane) < int(block_size):
+        m_lane = m_lane % fx.Index(cshuffle_mlane)
     n_lane = tx % c_nlane
     c_evec = fx.Index(EVec)
 
@@ -371,6 +376,10 @@ def c_shuffle_epilog(
         row_pred = None
         if isinstance(row_ctx_raw, tuple) and len(row_ctx_raw) == 2:
             row_ctx, row_pred = row_ctx_raw
+
+        if cshuffle_mlane * int(cshuffle_nlane) < int(block_size):
+            active = fx.Index(tx) < fx.Index(cshuffle_mlane * int(cshuffle_nlane))
+            row_pred = active if row_pred is None else row_pred & active
 
         _precomputed_rows.append((row_local, row, row_ctx, row_pred))
 

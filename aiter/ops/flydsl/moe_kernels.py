@@ -188,6 +188,7 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
+    is_mxfp8 = a_dtype == "fp8" and b_dtype == "fp8"
     # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
     # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
     # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
@@ -195,10 +196,11 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    # tile_m=16 halves the M quantum: 1.18-1.35x at E=896 inter=384, token<=512 only.
+    # Existing a16w4 tuning benefits from tile_m=16 at E=896, inter=384.
+    # Also expose that M quantum for sparse MXFP8 expert batches.
     tile_ms = (
         [16, 32, 64, 128]
-        if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
+        if (is_fp4_b and (a_dtype == "fp8" or is_a16w4)) or is_mxfp8
         else [32, 64, 128]
     )
 
@@ -208,8 +210,11 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
-        # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
-        if tm == 32 or (tm == 16 and is_a16w4):
+        if tm == 16 and is_mxfp8:
+            # GUI halves the output N tile. Keep at least one complete
+            # 32-element quantization group in each CTA.
+            tile_ns = [64, 128]
+        elif tm == 32 or (tm == 16 and is_a16w4):
             # 192|384, 256|512 exactly; a16w4-only (that port takes tile_n as given).
             tile_ns = [32, 64, 128, 192, 256] if is_a16w4 else [32, 64, 128]
         else:
@@ -240,10 +245,12 @@ def get_flydsl_stage1_kernels(
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
                                     # k_wave (intra-block K-slice): only for the
-                                    # small-M tiles (tile_m==32, plus 16 on a16w4 only),
+                                    # small-M tiles,
                                     # and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
-                                    _small_m = tm == 32 or (tm == 16 and is_a16w4)
+                                    _small_m = tm == 32 or (
+                                        tm == 16 and (is_a16w4 or is_mxfp8)
+                                    )
                                     k_waves = (
                                         [1, 2, 4]
                                         if (_small_m and kb == 1 and not go)
@@ -300,7 +307,7 @@ def get_flydsl_stage2_kernels(
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
     tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
-    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if (is_fp4 or is_fp8) else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
     b_nts = [0, 2]
@@ -381,8 +388,6 @@ def get_flydsl_stage2_v2_kernels(
     valid_pairs = {("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")}
     if (a_dtype, b_dtype) not in valid_pairs:
         return kernels
-    if a_dtype == "fp8" and b_dtype == "fp8" and block_m == 16:
-        return kernels
     # tile_m=16 requires the native SBM16 layout: its A-scale chunks are only
     # valid when the sort block (sbm=block_m) is also 16, so re-tiling a larger
     # sort block down to 16 is excluded.
@@ -426,6 +431,10 @@ def get_flydsl_stage2_v2_kernels(
                                 "sort_block_m": block_m,
                                 "v2": True,
                             }
+    if (a_dtype, b_dtype) == ("fp8", "fp8"):
+        for name, params in list(kernels.items()):
+            if params["tile_m"] <= 32:
+                kernels[name + "_f32lds"] = {**params, "bf16_lds": False}
     return kernels
 
 
@@ -1647,7 +1656,10 @@ def _flydsl_moe_stage1_impl(
     sorted_size = max(
         sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
     )
-    padded_rows = (sorted_size + 255) // 256 * 256
+    # The layout GEMM2's BM16 path assigns a full 32-row scale chunk to
+    # each 16-row sort block. Legacy GEMM2 instead packs adjacent blocks.
+    scale_rows = sorted_size * (2 if _v2_output_layout and tile_m == 16 else 1)
+    padded_rows = (scale_rows + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
     out_scale_sorted_flat = (
         torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)

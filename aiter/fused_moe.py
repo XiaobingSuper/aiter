@@ -1296,6 +1296,46 @@ def _fused_moe_impl(
             sort_reverse_sorted,
         ) = sorting_ret
         local_topk_ids = None
+    elif (
+        stage1_func is _flydsl_stage1_wrapper
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and quant_type == QuantType.per_1x32
+        and block_size_M == 16
+        and 0 < M <= 64
+        and M * topk <= 512
+        and topk < 256
+        and 0 < global_E <= 256
+        and expert_mask is None
+        and num_local_tokens is None
+        and not need_local_topk_ids
+        and not metadata.flat
+        and moe_sorting_dispatch_policy == 0
+        and not _USE_CK_MOE_SORTING
+        and not _USE_FLYDSL_MOE_SORTING
+        and _MOE_SORT_BACKEND == "auto"
+        and topk_ids.dtype == dtypes.i32
+        and topk_weight.dtype == dtypes.fp32
+        and topk_ids.is_contiguous()
+        and topk_weight.is_contiguous()
+        and (M * model_dim * dtype.itemsize) % 16 == 0
+        and get_gfx() == "gfx950"
+    ):
+        from aiter.ops.flydsl.kernels.moe_sorting_small import small_moe_sort
+
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            small_moe_sort(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                accumulate=not stage2_uses_route_reduce(metadata.stage2),
+                output=output,
+            )
+        )
+        local_topk_ids = None
     else:
         sorting_ret = moe_sorting(
             topk_ids,
