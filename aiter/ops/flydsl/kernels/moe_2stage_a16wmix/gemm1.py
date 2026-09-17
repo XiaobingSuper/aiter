@@ -153,7 +153,7 @@ def _gemm1_body_a16w4(
     # ---- A path (shared with gemm2, see utils.make_a_loader) -------------------
     # a_load_threads (256 at k_wave=1) cooperatively stage one k-group's BM x TILE_K bf16
     # tile into LDS; stage1's A-LDS is carved into k_wave groups x 2 pipeline slots.
-    # The wide-K decode tile needs XOR swizzling to reduce LDS read conflicts.
+    # Map the wide-K decode tile to MFMA lanes to avoid LDS read bank conflicts.
     c_k_div4 = (K * elem_bytes) // 4
 
     def _a_row_base_dwords(row_local):
@@ -176,7 +176,8 @@ def _gemm1_body_a16w4(
         k_blocks16=k_blocks16,
         lane_div_16=lane_div_16,
         lane_mod_16=lane_mod_16,
-        swizzle=(
+        swizzle=False,
+        mfma_lane_layout=(
             BM == 16
             and w_dtype == "fp4"
             and not use_k16

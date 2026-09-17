@@ -253,6 +253,7 @@ def make_a_loader(
     dma_via_vgpr,
     k_grp_base_bytes=None,
     A_SLOT_BYTES=0,
+    mfma_lane_layout=False,
 ):
     """Build the shared A (activation) LDS path: global->LDS staging + fragment reads.
 
@@ -280,6 +281,9 @@ def make_a_loader(
       * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
                              splits the block into per-k-group loader sets).
       * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
+      * ``mfma_lane_layout`` BM16 K32-MFMA layout: [K//128, K8-in-K32, K32-group,
+                             M16, K8]. Consecutive lanes read consecutive 16 B chunks.
+                             Requires TILE_K divisible by 128 and no XOR swizzle.
     """
     elem_bytes = 2  # bf16
     # Per-thread A gather: each thread moves 16 B (v8bf16) per pass.
@@ -300,9 +304,19 @@ def make_a_loader(
     x_row_base_div4 = []
     for i in range_constexpr(num_x_loads):
         tile_idx = tx_base + fx.Int32(i * a_load_threads * chunk_i32)
-        row_local = tile_idx // fx.Int32(tile_k_dwords)
+        if const_expr(mfma_lane_layout):
+            pack = tile_idx // fx.Int32(4)
+            row_local = pack % fx.Int32(16)
+            col_dw = (
+                (pack // fx.Int32(256)) * fx.Int32(64)
+                + ((pack // fx.Int32(16)) % fx.Int32(4)) * fx.Int32(16)
+                + ((pack // fx.Int32(64)) % fx.Int32(4)) * fx.Int32(4)
+            )
+        else:
+            row_local = tile_idx // fx.Int32(tile_k_dwords)
+            col_dw = tile_idx % fx.Int32(tile_k_dwords)
         x_row_local.append(row_local)
-        x_col_dw.append(tile_idx % fx.Int32(tile_k_dwords))
+        x_col_dw.append(col_dw)
         x_row_base_div4.append(row_base_dwords(row_local))
 
     x_buf = _global_i32_buffer_view(a_ptr, a_num_bytes)
@@ -342,7 +356,14 @@ def make_a_loader(
             )
             row_k_dw = x_row_base_div4[i] + base_k_div4
             global_byte = row_k_dw * fx.Int32(4) + col_sw
-            if const_expr(slot_byte is None):
+            if const_expr(mfma_lane_layout):
+                # Direct-to-LDS DMA keeps a linear destination; permute its source.
+                lds_byte = (
+                    tx_base + fx.Int32(i * a_load_threads * chunk_i32)
+                ) * fx.Int32(4)
+                if const_expr(slot_byte is not None):
+                    lds_byte = lds_byte + slot_byte
+            elif const_expr(slot_byte is None):
                 lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
             else:
                 lds_byte = (
@@ -366,7 +387,15 @@ def make_a_loader(
             fx.Int32(k_blocks16),
             enable=swizzle,
         )
-        if k_grp_base_bytes is None:
+        if const_expr(mfma_lane_layout):
+            byte_off = (
+                fx.Int32((ku // 4) * 4096 + (ku % 4) * 1024)
+                + lane_div_16 * fx.Int32(256)
+                + row * fx.Int32(16)
+            )
+            if k_grp_base_bytes is not None:
+                byte_off = byte_off + k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES)
+        elif k_grp_base_bytes is None:
             byte_off = row * fx.Int32(KH_TILE_BYTES) + col_swz_bytes
         else:
             # byte offset within this k-group's A-LDS slot -> 16-byte tile index.
