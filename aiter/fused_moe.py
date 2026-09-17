@@ -1298,8 +1298,10 @@ def _fused_moe_impl(
         local_topk_ids = None
     elif (
         stage1_func is _flydsl_stage1_wrapper
-        and q_dtype_a == dtypes.fp8
-        and q_dtype_w == dtypes.fp8
+        and (
+            (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
+            or (q_dtype_a == dtypes.bf16 and q_dtype_w == dtypes.fp4x2)
+        )
         and quant_type == QuantType.per_1x32
         and block_size_M == 16
         and 0 < M <= 64

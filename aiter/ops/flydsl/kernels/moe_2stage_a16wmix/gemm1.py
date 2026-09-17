@@ -76,9 +76,22 @@ def _gemm1_body_a16w4(
     # wider N-slice; partials LDS-reduced across k-group peers before epilogue.
     _NUM_WAVES = 4
     num_n_waves = _NUM_WAVES // k_wave
+    # Interleaving is measured for these BM16 gfx950 FP4 tiles. Keep the
+    # existing schedule for other tiles, notably the K128/kw2 large-M path.
+    interleave_n = (
+        BM == 16
+        and w_dtype == "fp4"
+        and not use_k16
+        and (TILE_N, TILE_K, k_wave) in ((64, 256, 2), (192, 128, 1))
+    )
     if const_expr(k_wave > 1):
         wave_n_id = wave % fx.Int32(num_n_waves)
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
+        if const_expr(interleave_n):
+            # readfirstlane loses the integer range of the four-wave block.
+            # Restore it to fold K/scale addressing to shifts. The power-of-two
+            # mask is exact; it removes signed-division corrections.
+            wave_k_id = wave_k_id & fx.Int32(k_wave - 1)
     else:
         wave_n_id = wave
         wave_k_id = fx.Int32(0)
@@ -257,8 +270,11 @@ def _gemm1_body_a16w4(
     def compute_tile(b_tile, a_frags):
         # Accumulators are the enclosing rmem tensors, mutated in place.
         g_raw, u_raw, g_sc, u_sc = b_tile
-        for ni in range_constexpr(num_acc_n):
-            for ku in range_constexpr(k_unroll):
+        # Interleave independent N accumulators and finish each A fragment's
+        # uses before advancing K; each accumulator retains its original K order.
+        for outer in range_constexpr(k_unroll if interleave_n else num_acc_n):
+            for inner in range_constexpr(num_acc_n if interleave_n else k_unroll):
+                ni, ku = (inner, outer) if interleave_n else (outer, inner)
                 gb = b_loader.upconvert(g_raw[ni], ku, g_sc[ni][ku])
                 ub = b_loader.upconvert(u_raw[ni], ku, u_sc[ni][ku])
                 for mi in range_constexpr(m_repeat):

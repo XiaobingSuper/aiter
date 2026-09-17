@@ -3,7 +3,7 @@
 
 """Route compaction for small MoE batches.
 
-Up to 64 routes use a single wave and first-occurrence expert order, without
+Short route lists use a single wave and first-occurrence expert order, without
 atomics or a histogram. Larger batches use one CTA with an LDS histogram and
 ascending expert order; route order within an expert may vary. GEMMs consume
 explicit expert and packed route IDs. Other CTAs zero the accumulation buffer.
@@ -110,7 +110,7 @@ def _compile_small_sort(tokens, topk, experts, bm, zero_bytes):
 @functools.lru_cache(maxsize=128)
 def _compile_cta_sort(tokens, topk, experts, bm, zero_bytes):
     routes = tokens * topk
-    assert 64 < routes <= 512 and 0 < experts <= 256
+    assert 0 < routes <= 512 and 0 < experts <= 256
     assert bm in (16, 32) and zero_bytes % 16 == 0
     grid = 1 + (zero_bytes + 4095) // 4096
 
@@ -248,7 +248,12 @@ def small_moe_sort(
         if accumulate
         else torch.empty((0, 0), device=device, dtype=dtype)
     )
-    compile_sort = _compile_small_sort if routes <= 64 else _compile_cta_sort
+    # For 33-64 routes the CTA histogram also avoids the wave sort's quadratic
+    # route comparisons. Preserve the wave path's wider expert/block support.
+    use_wave = routes <= 64 and (
+        routes <= 32 or num_experts > 256 or block_size not in (16, 32)
+    )
+    compile_sort = _compile_small_sort if use_wave else _compile_cta_sort
     launch = compile_sort(
         tokens, topk, num_experts, block_size, out.numel() * out.element_size()
     )
