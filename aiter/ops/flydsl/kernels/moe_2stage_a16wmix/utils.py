@@ -187,7 +187,7 @@ def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
     """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
 
     Both the DMA write and the LDS read go through this helper so the physical layout
-    stays consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
+    stays consistent. Callers select it according to their tile geometry.
     """
     if not enable:
         return col_bytes
@@ -269,11 +269,10 @@ def make_a_loader(
                              to the REAL [n_tokens, K] alloc HW-clamps padding-row loads
                              (sentinel token id >= n_tokens) to 0. A ~4 GB resource
                              would instead fault on unmapped memory.
-      * ``swizzle``          gemm2 XOR-swizzles A to kill LDS bank conflicts: the GMEM
+      * ``swizzle``          XOR-swizzles A to reduce LDS bank conflicts: the GMEM
                              source column is swizzled on the write (buffer_load_lds
                              ignores an arbitrary swizzled per-lane LDS dest -> NaN) and
-                             ``load`` applies the SAME swizzle on the read. gemm1 is
-                             linear -- its DMA source is already conflict-free.
+                             ``load`` applies the SAME swizzle on the read.
       * ``k_grp_base_bytes`` gemm1 only: base of this wave's k_wave group. Combined with
                              ``A_SLOT_BYTES`` and the per-call ``slot`` it selects the
                              double-buffer ping/pong slot. None (gemm2) omits the term
