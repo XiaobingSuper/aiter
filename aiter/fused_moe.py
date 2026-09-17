@@ -150,6 +150,7 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -164,7 +165,11 @@ def _adaptive_moe_sort(
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
         if atomic
         else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     )
@@ -217,7 +222,7 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (atomic)               yes        fused sort zeroes the supplied buffer
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -429,7 +434,6 @@ def _moe_sorting_impl(
     ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -440,6 +444,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -1320,20 +1325,27 @@ def _fused_moe_impl(
         and topk_weight.dtype == dtypes.fp32
         and topk_ids.is_contiguous()
         and topk_weight.is_contiguous()
-        and (M * model_dim * dtype.itemsize) % 16 == 0
+        and dtype in (dtypes.bf16, dtypes.fp16)
         and get_gfx() == "gfx950"
+        and _mxfp4_aux_instance_supported(
+            global_E,
+            topk,
+            model_dim,
+            block_size_M,
+            not stage2_uses_route_reduce(metadata.stage2),
+        )
     ):
-        from aiter.ops.flydsl.kernels.moe_sorting_small import small_moe_sort
-
+        # Reuse the generated sort-only kernel; BF16 activations stay unquantized.
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            small_moe_sort(
+            _adaptive_moe_sort(
                 topk_ids,
                 topk_weight,
                 global_E,
-                model_dim,
-                dtype,
+                topk,
                 block_size_M,
-                accumulate=not stage2_uses_route_reduce(metadata.stage2),
+                model_dim,
+                atomic=not stage2_uses_route_reduce(metadata.stage2),
+                moebuf_dtype=dtype,
                 output=output,
             )
         )

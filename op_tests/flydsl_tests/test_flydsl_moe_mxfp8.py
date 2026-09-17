@@ -34,27 +34,22 @@ pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="requires gfx950")
         (1, 5, "random"),
         (3, 5, "shared"),
         (8, 5, "shared"),
-        (8, 8, "same"),
+        (8, 5, "same"),
         (2, 5, "invalid"),
         (16, 5, "random"),
         (32, 5, "shared"),
         (64, 5, "shared"),
-        (64, 8, "same"),
+        (64, 5, "same"),
         (17, 5, "invalid"),
-        (64, 8, "all_invalid"),
-        (64, 8, "one_expert"),
-        (64, 5, "max_experts"),
+        (64, 5, "all_invalid"),
     ],
 )
 @pytest.mark.parametrize("accumulate", [False, True])
-@pytest.mark.parametrize("bm", [16, 32])
-def test_small_sort_graph_replay(tokens, topk, pattern, accumulate, bm):
-    from aiter.ops.flydsl.kernels.moe_sorting_small import small_moe_sort
+def test_adaptive_sort_graph_replay(tokens, topk, pattern, accumulate):
+    from aiter.fused_moe import _adaptive_moe_sort
 
-    experts = (
-        1 if pattern == "one_expert" else (256 if pattern == "max_experts" else 129)
-    )
-    hidden = 256
+    # Exercise a generated MiniMax instance, including repeated and invalid routes.
+    experts, hidden, bm = 129, 6144, 16
     ids = torch.empty((tokens, topk), device="cuda", dtype=torch.int32)
     weights = torch.empty((tokens, topk), device="cuda", dtype=torch.float32)
     output = torch.full((tokens, hidden), 42, device="cuda", dtype=dtypes.bf16)
@@ -75,14 +70,15 @@ def test_small_sort_graph_replay(tokens, topk, pattern, accumulate, bm):
         output.fill_(42)
 
     def run():
-        return small_moe_sort(
+        return _adaptive_moe_sort(
             ids,
             weights,
             experts,
-            hidden,
-            dtypes.bf16,
+            topk,
             bm,
-            accumulate=accumulate,
+            hidden,
+            atomic=accumulate,
+            moebuf_dtype=dtypes.bf16,
             output=output if accumulate else None,
         )
 
@@ -117,7 +113,7 @@ def test_small_sort_graph_replay(tokens, topk, pattern, accumulate, bm):
                     (packed, float(sw_cpu[p]))
                 )
             else:
-                assert packed == (topk << 24) | tokens
+                assert (packed & 0xFFFFFF) == tokens
                 assert float(sw_cpu[p]) == 0
         assert {e: sorted(v) for e, v in actual.items()} == {
             e: sorted(v) for e, v in expected.items()
