@@ -29,27 +29,46 @@ pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="requires gfx950")
 
 
 @pytest.mark.parametrize(
-    "tokens,topk,pattern",
+    "tokens,experts,hidden,topk,pattern",
     [
-        (1, 5, "random"),
-        (3, 5, "shared"),
-        (8, 5, "shared"),
-        (8, 5, "same"),
-        (2, 5, "invalid"),
-        (16, 5, "random"),
-        (32, 5, "shared"),
-        (64, 5, "shared"),
-        (64, 5, "same"),
-        (17, 5, "invalid"),
-        (64, 5, "all_invalid"),
+        (1, 129, 6144, 5, "random"),
+        (3, 129, 6144, 5, "shared"),
+        (8, 129, 6144, 5, "shared"),
+        (8, 129, 6144, 5, "same"),
+        (2, 129, 6144, 5, "invalid"),
+        (16, 129, 6144, 5, "random"),
+        (32, 129, 6144, 5, "shared"),
+        (64, 129, 6144, 5, "shared"),
+        (64, 129, 6144, 5, "same"),
+        (17, 129, 6144, 5, "invalid"),
+        (64, 129, 6144, 5, "all_invalid"),
+        (103, 129, 6144, 5, "topk"),  # Above the 512-route limit.
+        (8, 33, 7168, 8, "topk"),
+        (8, 56, 3584, 16, "topk"),
+        (64, 128, 3072, 4, "topk"),
+        (64, 256, 3072, 8, "topk"),
+        (32, 256, 4096, 6, "topk"),
+        (8, 896, 3584, 16, "topk"),  # Above the 256-expert limit.
+        (8, 7, 1024, 5, "topk"),  # No generated instance: general-sort fallback.
     ],
 )
 @pytest.mark.parametrize("accumulate", [False, True])
-def test_adaptive_sort_graph_replay(tokens, topk, pattern, accumulate):
-    from aiter.fused_moe import _adaptive_moe_sort
+@pytest.mark.parametrize("output_aux", [False, True])
+def test_adaptive_sort_graph_replay(
+    tokens, experts, hidden, topk, pattern, accumulate, output_aux, monkeypatch
+):
+    import importlib
 
-    # Exercise a generated MiniMax instance, including repeated and invalid routes.
-    experts, hidden, bm = 129, 6144, 16
+    fm = importlib.import_module("aiter.fused_moe")
+    monkeypatch.setattr(fm, "_USE_CK_MOE_SORTING", False)
+    monkeypatch.setattr(fm, "_USE_FLYDSL_MOE_SORTING", False)
+    monkeypatch.setattr(fm, "_MOE_SORT_BACKEND", "auto")
+
+    bm = 16
+    if output_aux and not fm._mxfp4_aux_instance_supported(
+        experts, topk, hidden, bm, accumulate
+    ):
+        pytest.skip("aux outputs require a generated instance")
     ids = torch.empty((tokens, topk), device="cuda", dtype=torch.int32)
     weights = torch.empty((tokens, topk), device="cuda", dtype=torch.float32)
     output = torch.full((tokens, hidden), 42, device="cuda", dtype=dtypes.bf16)
@@ -66,21 +85,25 @@ def test_adaptive_sort_graph_replay(tokens, topk, pattern, accumulate):
             ids[-1, -1] = experts
         elif pattern == "all_invalid":
             ids.fill_(-1)
+        elif pattern == "topk":
+            ids.copy_(torch.rand((tokens, experts), device="cuda").topk(topk).indices)
         weights.normal_()
         output.fill_(42)
 
     def run():
-        return _adaptive_moe_sort(
+        result = fm.moe_sorting(
             ids,
             weights,
             experts,
-            topk,
-            bm,
             hidden,
-            atomic=accumulate,
-            moebuf_dtype=dtypes.bf16,
-            output=output if accumulate else None,
+            dtypes.bf16,
+            bm,
+            accumulate=accumulate,
+            output_aux=output_aux,
+            output=output,
         )
+        assert len(result) == (7 if output_aux else 5)
+        return result[:5]
 
     fill(3)
     run()
@@ -123,6 +146,7 @@ def test_adaptive_sort_graph_replay(tokens, topk, pattern, accumulate):
             assert torch.count_nonzero(out) == 0
         else:
             assert out.numel() == 0
+            assert torch.all(output == 42)
 
 
 def _unshuffle_scale(scale):

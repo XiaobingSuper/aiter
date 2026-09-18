@@ -220,11 +220,7 @@ def get_flydsl_stage1_kernels(
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
         for tn in tile_ns:
-            # A16W4 decode: keep a wider K tile without intra-block K reduction.
-            n_tile_ks = (
-                [*tile_ks, 512] if is_a16w4 and (tm, tn) == (16, 64) else tile_ks
-            )
-            for tk in n_tile_ks:
+            for tk in tile_ks:
                 for wpe in waves_per_eus:
                     for kb in k_batches if wpe == 3 and tm == 32 and is_fp4_a else [1]:
                         for bnt in b_nts:
@@ -260,7 +256,7 @@ def get_flydsl_stage1_kernels(
                                         if (_small_m and kb == 1 and not go)
                                         else [1]
                                     )
-                                    for kw in [1] if tk == 512 else k_waves:
+                                    for kw in k_waves:
                                         if num_n_waves * kw > 8:
                                             continue
                                         if kw > 1 and 4 * tn > tk:

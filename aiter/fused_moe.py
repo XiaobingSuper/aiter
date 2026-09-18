@@ -164,15 +164,14 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        (
+    if atomic:
+        moe_buf = (
             output
             if output is not None
             else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
         )
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
@@ -427,13 +426,38 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
 
-    if (
+    use_adaptive_sort = (
         output_aux
         and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
         and _MOE_SORT_BACKEND not in ("opus", "ck")
+    )
+    # The single-CTA sort is also useful without aux outputs at small routing
+    # workloads. Selection depends only on the sort inputs and generated-kernel
+    # support, independently of the downstream GEMM or activation/weight dtype.
+    if (
+        not output_aux
+        and use_opus
+        and _MOE_SORT_BACKEND == "auto"
+        and dispatch_policy == 0
+        and not return_local_topk_ids
+        and expert_mask is None
+        and num_local_tokens is None
+        and block_size == 16
+        and 0 < M * topk <= 512
+        and topk < 256
+        and 0 < num_experts <= 256
+        and topk_ids.dtype == dtypes.i32
+        and topk_weights.dtype == dtypes.fp32
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and moebuf_dtype in (dtypes.bf16, dtypes.fp16)
+        and get_gfx() == "gfx950"
+        and _mxfp4_aux_instance_supported(
+            num_experts, topk, model_dim, block_size, accumulate
+        )
     ):
-        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
-        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        use_adaptive_sort = True
+    if use_adaptive_sort:
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -442,7 +466,7 @@ def _moe_sorting_impl(
             block_size,
             model_dim,
             atomic=accumulate,
-            emit_aux=True,
+            emit_aux=bool(output_aux),
             moebuf_dtype=moebuf_dtype,
             output=output,
         )
@@ -1300,55 +1324,6 @@ def _fused_moe_impl(
             sort_m_indices,
             sort_reverse_sorted,
         ) = sorting_ret
-        local_topk_ids = None
-    elif (
-        stage1_func is _flydsl_stage1_wrapper
-        and (
-            (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
-            or (q_dtype_a == dtypes.bf16 and q_dtype_w == dtypes.fp4x2)
-        )
-        and quant_type == QuantType.per_1x32
-        and block_size_M == 16
-        and 0 < M <= 64
-        and M * topk <= 512
-        and topk < 256
-        and 0 < global_E <= 256
-        and expert_mask is None
-        and num_local_tokens is None
-        and not need_local_topk_ids
-        and not metadata.flat
-        and moe_sorting_dispatch_policy == 0
-        and not _USE_CK_MOE_SORTING
-        and not _USE_FLYDSL_MOE_SORTING
-        and _MOE_SORT_BACKEND == "auto"
-        and topk_ids.dtype == dtypes.i32
-        and topk_weight.dtype == dtypes.fp32
-        and topk_ids.is_contiguous()
-        and topk_weight.is_contiguous()
-        and dtype in (dtypes.bf16, dtypes.fp16)
-        and get_gfx() == "gfx950"
-        and _mxfp4_aux_instance_supported(
-            global_E,
-            topk,
-            model_dim,
-            block_size_M,
-            not stage2_uses_route_reduce(metadata.stage2),
-        )
-    ):
-        # Reuse the generated sort-only kernel; BF16 activations stay unquantized.
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            _adaptive_moe_sort(
-                topk_ids,
-                topk_weight,
-                global_E,
-                topk,
-                block_size_M,
-                model_dim,
-                atomic=not stage2_uses_route_reduce(metadata.stage2),
-                moebuf_dtype=dtype,
-                output=output,
-            )
-        )
         local_topk_ids = None
     else:
         sorting_ret = moe_sorting(
