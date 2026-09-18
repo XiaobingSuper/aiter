@@ -156,7 +156,6 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
-    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -170,14 +169,11 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    if atomic:
-        moe_buf = (
-            output
-            if output is not None
-            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        )
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    moe_buf = (
+        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        if atomic
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
@@ -227,7 +223,7 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (atomic)               yes        fused sort zeroes the supplied buffer
+#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -432,38 +428,14 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
 
-    use_adaptive_sort = (
+    if (
         output_aux
         and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
         and _MOE_SORT_BACKEND not in ("opus", "ck")
-    )
-    # The single-CTA sort is also useful without aux outputs at small routing
-    # workloads. Selection depends only on the sort inputs and generated-kernel
-    # support, independently of the downstream GEMM or activation/weight dtype.
-    if (
-        not output_aux
-        and use_opus
-        and _MOE_SORT_BACKEND == "auto"
-        and dispatch_policy == 0
-        and not return_local_topk_ids
-        and expert_mask is None
-        and num_local_tokens is None
-        and block_size == 16
-        and 0 < M * topk <= 512
-        and topk < 256
-        and 0 < num_experts <= 256
-        and topk_ids.dtype == dtypes.i32
-        and topk_weights.dtype == dtypes.fp32
-        and topk_ids.is_contiguous()
-        and topk_weights.is_contiguous()
-        and moebuf_dtype in (dtypes.bf16, dtypes.fp16)
-        and get_gfx() == "gfx950"
-        and _mxfp4_aux_instance_supported(
-            num_experts, topk, model_dim, block_size, accumulate
-        )
     ):
-        use_adaptive_sort = True
-    if use_adaptive_sort:
+        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
+        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -472,9 +444,8 @@ def _moe_sorting_impl(
             block_size,
             model_dim,
             atomic=accumulate,
-            emit_aux=bool(output_aux),
+            emit_aux=True,
             moebuf_dtype=moebuf_dtype,
-            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)

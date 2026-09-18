@@ -55,6 +55,8 @@ def run_torch_moe_sorting(
     # enforces that descriptor/allocation contract.
     max_num_tokens_padded = max_num_m_blocks * block_size
     init_val = topk << 24 | m
+    if init_val >= 1 << 31:
+        init_val -= 1 << 32
     sorted_ids = torch.full(
         (max_num_tokens_padded,), init_val, dtype=dtypes.i32, device=device
     )
@@ -151,7 +153,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
         atol=0,
         msg="num_tokens_post_padded",
     )
-    weight_mask = sorted_ids_a != (topk << 24 | num_rows)
+    weight_mask = (sorted_ids_a & 0xFFFFFF) != num_rows
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
     errs["sorted_ids"] = checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
@@ -188,6 +190,8 @@ def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
         has_expert_mask=False,
         padding_extra=0,
     )
+    topk_ids[0, 0] = -1
+    topk_ids[-1, -1] = E
     for block_size in (16, 32, 64, 128):
         ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size)
         out = moe_sorting(
@@ -218,6 +222,105 @@ def test_moe_sorting_opus_aux_capacity(dtype, model_dim):
         assert sorted_weights.numel() == expected_capacity
         assert aux_m_indices.numel() == expected_capacity
         assert aux_reverse_sorted.numel() == topk_ids.numel()
+        size = int(out[3][0])
+        ids = sorted_ids[:size]
+        assert torch.equal(aux_m_indices[:size], ids & 0xFFFFFF)
+        valid = (ids & 0xFFFFFF) < token
+        routes = (ids[valid] & 0xFFFFFF) * topk + ((ids[valid] >> 24) & 0xFF)
+        positions = torch.arange(size, device=ids.device, dtype=dtypes.i32)[valid]
+        assert torch.equal(aux_reverse_sorted[routes.long()], positions)
+        assert torch.all(
+            aux_reverse_sorted[(topk_ids.flatten() < 0) | (topk_ids.flatten() >= E)]
+            == -1
+        )
+
+
+def test_moe_sorting_small_graph(dtype, model_dim):
+    """Stable routes, padding, and output reuse across graph replays and fallbacks."""
+    cases = [
+        (1, 1, 1),
+        (8, 7, 4),
+        (16, 31, 8),
+        (16, 33, 8),
+        (1, 129, 5),
+        (32, 129, 5),
+        (64, 129, 5),
+        (128, 129, 5),
+        (64, 128, 8),
+        (65, 128, 8),  # Route-count boundary.
+        (32, 256, 8),
+        (33, 256, 8),  # Bitset-storage boundary.
+        (64, 256, 8),
+        (8, 257, 8),
+        (1, 256, 255),
+    ]
+
+    def check_case(tokens, experts, topk, bm, accumulate):
+        ids = torch.empty((tokens, topk), dtype=dtypes.i32, device="cuda")
+        weights = torch.empty((tokens, topk), device="cuda")
+        output = torch.empty((tokens, model_dim), dtype=dtype, device="cuda")
+
+        def fill(seed):
+            torch.manual_seed(seed)
+            ids.copy_(torch.rand((tokens, experts), device="cuda").topk(topk).indices)
+            if seed == 1:
+                ids[0, 0] = -1
+                ids[-1, -1] = experts
+            elif seed == 2:
+                ids.fill_(-1)
+            elif experts <= 33:
+                ids.fill_(experts - 1)  # Repeated routes must retain input order.
+            weights.normal_()
+            output.fill_(42)
+
+        def run():
+            return moe_sorting(
+                ids,
+                weights,
+                experts,
+                model_dim,
+                dtype,
+                bm,
+                accumulate=accumulate,
+                output=output,
+            )
+
+        fill(0)
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run()
+        for seed in (1, 2, 3):
+            fill(seed)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref = run_torch_moe_sorting(ids.cpu(), weights.cpu(), experts, bm)
+            si, sw, se, nv, buf = out
+            size = int(ref[3][0])
+            blocks = size // bm
+            assert torch.equal(nv.cpu(), ref[3])
+            assert torch.equal(si[:size].cpu(), ref[0][:size])
+            assert torch.equal(se[:blocks].cpu(), ref[2][:blocks])
+            valid = (ref[0][:size] & 0xFFFFFF) < tokens
+            assert torch.equal(sw[:size].cpu()[valid], ref[1][:size][valid])
+            assert torch.count_nonzero(sw[:size].cpu()[~valid]) == 0
+            if accumulate:
+                assert buf.data_ptr() == output.data_ptr()
+                assert torch.count_nonzero(buf) == 0
+            else:
+                assert buf.numel() == 0
+                assert torch.all(output == 42)
+
+    old_backends = fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING
+    set_moe_sorting_backend("opus")
+    try:
+        for (tokens, experts, topk), bm, accumulate in itertools.product(
+            cases, (16, 32, 64, 128), (False, True)
+        ):
+            check_case(tokens, experts, topk, bm, accumulate)
+    finally:
+        fm._USE_CK_MOE_SORTING, fm._USE_FLYDSL_MOE_SORTING = old_backends
 
 
 def _build_moe_sorting_inputs(
@@ -794,6 +897,7 @@ def main():
 
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_capacity(dtype, args.model_dim)
+        test_moe_sorting_small_graph(dtype, args.model_dim)
         df = []
         for (
             padding_extra,

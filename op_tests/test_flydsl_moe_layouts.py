@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""BM16 MXFP8 MoE: validate the scale payload and both GEMM2 layouts.
+"""BM16 MoE: validate BF16 LDS layout, MXFP8 scales, and both GEMM2 layouts.
 
 Run on gfx950:
-    pytest op_tests/flydsl_tests/test_flydsl_moe_mxfp8.py -q
+    python op_tests/test_flydsl_moe_layouts.py
 """
 
 import pytest
@@ -26,127 +26,6 @@ from aiter.utility.fp4_utils import e8m0_to_f32
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import gen
 
 pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="requires gfx950")
-
-
-@pytest.mark.parametrize(
-    "tokens,experts,hidden,topk,pattern",
-    [
-        (1, 129, 6144, 5, "random"),
-        (3, 129, 6144, 5, "shared"),
-        (8, 129, 6144, 5, "shared"),
-        (8, 129, 6144, 5, "same"),
-        (2, 129, 6144, 5, "invalid"),
-        (16, 129, 6144, 5, "random"),
-        (32, 129, 6144, 5, "shared"),
-        (64, 129, 6144, 5, "shared"),
-        (64, 129, 6144, 5, "same"),
-        (17, 129, 6144, 5, "invalid"),
-        (64, 129, 6144, 5, "all_invalid"),
-        (103, 129, 6144, 5, "topk"),  # Above the 512-route limit.
-        (8, 33, 7168, 8, "topk"),
-        (8, 56, 3584, 16, "topk"),
-        (64, 128, 3072, 4, "topk"),
-        (64, 256, 3072, 8, "topk"),
-        (32, 256, 4096, 6, "topk"),
-        (8, 896, 3584, 16, "topk"),  # Above the 256-expert limit.
-        (8, 7, 1024, 5, "topk"),  # No generated instance: general-sort fallback.
-    ],
-)
-@pytest.mark.parametrize("accumulate", [False, True])
-@pytest.mark.parametrize("output_aux", [False, True])
-def test_adaptive_sort_graph_replay(
-    tokens, experts, hidden, topk, pattern, accumulate, output_aux, monkeypatch
-):
-    import importlib
-
-    fm = importlib.import_module("aiter.fused_moe")
-    monkeypatch.setattr(fm, "_USE_CK_MOE_SORTING", False)
-    monkeypatch.setattr(fm, "_USE_FLYDSL_MOE_SORTING", False)
-    monkeypatch.setattr(fm, "_MOE_SORT_BACKEND", "auto")
-
-    bm = 16
-    if output_aux and not fm._mxfp4_aux_instance_supported(
-        experts, topk, hidden, bm, accumulate
-    ):
-        pytest.skip("aux outputs require a generated instance")
-    ids = torch.empty((tokens, topk), device="cuda", dtype=torch.int32)
-    weights = torch.empty((tokens, topk), device="cuda", dtype=torch.float32)
-    output = torch.full((tokens, hidden), 42, device="cuda", dtype=dtypes.bf16)
-
-    def fill(seed):
-        torch.manual_seed(seed)
-        ids.copy_(torch.randint(experts, ids.shape, device="cuda", dtype=torch.int32))
-        if pattern == "shared":
-            ids[:, -1] = experts - 1
-        elif pattern == "same":
-            ids.fill_(experts - 1)
-        elif pattern == "invalid":
-            ids[0].fill_(-1)
-            ids[-1, -1] = experts
-        elif pattern == "all_invalid":
-            ids.fill_(-1)
-        elif pattern == "topk":
-            ids.copy_(torch.rand((tokens, experts), device="cuda").topk(topk).indices)
-        weights.normal_()
-        output.fill_(42)
-
-    def run():
-        result = fm.moe_sorting(
-            ids,
-            weights,
-            experts,
-            hidden,
-            dtypes.bf16,
-            bm,
-            accumulate=accumulate,
-            output_aux=output_aux,
-            output=output,
-        )
-        assert len(result) == (7 if output_aux else 5)
-        return result[:5]
-
-    fill(3)
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        si, sw, se, nv, out = run()
-    for seed in (4, 5):
-        fill(seed)
-        graph.replay()
-        torch.cuda.synchronize()
-        ids_cpu, weights_cpu = ids.cpu(), weights.cpu()
-        expected = {}
-        for t in range(tokens):
-            for k in range(topk):
-                e = int(ids_cpu[t, k])
-                if 0 <= e < experts:
-                    expected.setdefault(e, []).append(
-                        ((k << 24) | t, float(weights_cpu[t, k]))
-                    )
-        size = int(nv[0])
-        assert int(nv[1]) == tokens
-        assert size == sum((len(v) + bm - 1) // bm * bm for v in expected.values())
-        actual = {}
-        si_cpu, sw_cpu, se_cpu = si.cpu(), sw.cpu(), se.cpu()
-        for p in range(size):
-            packed = int(si_cpu[p])
-            if (packed & 0xFFFFFF) < tokens:
-                actual.setdefault(int(se_cpu[p // bm]), []).append(
-                    (packed, float(sw_cpu[p]))
-                )
-            else:
-                assert (packed & 0xFFFFFF) == tokens
-                assert float(sw_cpu[p]) == 0
-        assert {e: sorted(v) for e, v in actual.items()} == {
-            e: sorted(v) for e, v in expected.items()
-        }
-        if accumulate:
-            assert out.data_ptr() == output.data_ptr()
-            assert torch.count_nonzero(out) == 0
-        else:
-            assert out.numel() == 0
-            assert torch.all(output == 42)
 
 
 def _unshuffle_scale(scale):
@@ -298,7 +177,6 @@ def test_mxfp8_bm16_scales_and_stage2(
                 a_dtype="fp8",
                 b_dtype="fp8",
                 epilog=epilog,
-                g2_bf16_lds=False if k_wave == 2 else None,
             )
             if epilog == "reduce":
                 _run_moe_reduction(target, out, tokens, topk, model_dim)
@@ -324,3 +202,111 @@ def test_mxfp8_bm16_scales_and_stage2(
                 use_async_copy=False,
             )
         torch.testing.assert_close(out, ref, rtol=0.03, atol=0.03)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="requires K32 BF16 MFMA")
+@pytest.mark.parametrize("model_dim", [1024, 2048])
+@pytest.mark.parametrize("w_dtype", ["fp4", "int4", "bf16"])
+@pytest.mark.parametrize(
+    "tile_n,tile_k,k_wave",
+    [
+        (64, 128, 1),
+        (64, 256, 2),
+        (64, 128, 4),
+        (128, 256, 1),
+        (192, 128, 1),
+        (64, 512, 1),
+        (64, 256, 4),
+        (32, 256, 2),
+    ],
+)
+def test_bm16_stage1_lds_layout(model_dim, w_dtype, tile_n, tile_k, k_wave):
+    from aiter.fused_moe import moe_sorting
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
+    from aiter.ops.quant import per_1x32_f4_quant, per_1x32_i4_quant
+    from aiter.ops.shuffle import (
+        pack_int8_to_packed_int4,
+        shuffle_scale_for_int4,
+        shuffle_weight,
+    )
+    from aiter.utility.fp4_utils import e8m0_shuffle, e8m0_to_f32, mxfp4_to_f32
+
+    tokens, experts, inter, topk = 35, 7, 384, 2
+    torch.manual_seed(0)
+    x = torch.randn((tokens, model_dim), device="cuda", dtype=dtypes.bf16) / 10
+    w = (
+        torch.randn((experts, 2 * inter, model_dim), device="cuda", dtype=dtypes.bf16)
+        / 10
+    )
+    if w_dtype == "fp4":
+        q, scale = per_1x32_f4_quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+        dequant = (
+            (
+                mxfp4_to_f32(q).view(experts, 2 * inter, model_dim // 32, 32)
+                * e8m0_to_f32(scale).view(experts, 2 * inter, model_dim // 32, 1)
+            )
+            .reshape_as(w)
+            .to(dtypes.bf16)
+        )
+        packed = shuffle_weight(q.view(experts, 2 * inter, model_dim // 2), (16, 16))
+        scale = e8m0_shuffle(scale)
+    elif w_dtype == "int4":
+        q, scale = per_1x32_i4_quant(w)
+        dequant = (
+            (
+                q.float().view(experts, 2 * inter, model_dim // 32, 32)
+                * scale.transpose(-1, -2).unsqueeze(-1)
+            )
+            .reshape_as(w)
+            .to(dtypes.bf16)
+        )
+        packed = pack_int8_to_packed_int4(shuffle_weight(q, (16, 16)))
+        scale = shuffle_scale_for_int4(scale, group_size=32).contiguous()
+    else:
+        dequant, packed = w, shuffle_weight(w, (16, 16))
+        scale = torch.empty(0, device="cuda", dtype=torch.uint8)
+
+    # Two shared experts exercise full BM16 blocks, a partial tail, and empty experts.
+    ids = (
+        torch.arange(topk, device="cuda", dtype=torch.int32)
+        .expand(tokens, topk)
+        .contiguous()
+    )
+    weights = torch.ones((tokens, topk), device="cuda")
+    si, _, se, nv, _ = moe_sorting(ids, weights, experts, model_dim, dtypes.bf16, 16)
+    out = torch.empty((si.numel(), inter), device="cuda", dtype=dtypes.bf16)
+    flydsl_a16w4_gemm1(
+        a_bf16=x,
+        w1_u8=packed,
+        w1_scale_u8=scale,
+        sorted_expert_ids=se,
+        cumsum_tensor=nv,
+        m_indices=si,
+        inter_sorted_bf16=out,
+        n_tokens=tokens,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter,
+        topk=topk,
+        tile_m=16,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        k_wave=k_wave,
+        w_dtype=w_dtype,
+    )
+    pos = torch.arange(int(nv[0]), device="cuda")
+    pos = pos[(si[pos] & 0xFFFFFF) < tokens]
+    assert pos.numel() == tokens * topk
+    projected = torch.einsum("mh,enh->men", x.float(), dequant.float())
+    gate, up = projected.chunk(2, dim=-1)
+    ref = torch.nn.functional.silu(gate) * up
+    torch.testing.assert_close(
+        out[pos].float(),
+        ref[si[pos] & 0xFFFFFF, se[pos // 16].long()],
+        rtol=0.02,
+        atol=0.005,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

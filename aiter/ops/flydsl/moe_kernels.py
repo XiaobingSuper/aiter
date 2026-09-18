@@ -435,10 +435,6 @@ def get_flydsl_stage2_v2_kernels(
                                 "sort_block_m": block_m,
                                 "v2": True,
                             }
-    if (a_dtype, b_dtype) == ("fp8", "fp8"):
-        for name, params in list(kernels.items()):
-            if params["tile_m"] <= 32:
-                kernels[name + "_f32lds"] = {**params, "bf16_lds": False}
     return kernels
 
 

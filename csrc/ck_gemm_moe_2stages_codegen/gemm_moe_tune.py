@@ -1159,7 +1159,6 @@ class FmoeTuner(TunerCommon):
             epilog=epilog,
             SBM=sbm,
             persist=kparams["persist"],
-            g2_bf16_lds=kparams.get("bf16_lds"),
             n_sorted_padded=n,
         )
         if epilog == "reduce":

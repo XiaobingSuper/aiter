@@ -270,21 +270,6 @@ def compile_mixed_moe_gemm1_common(
     v2out_tag = "_v2out" if v2_output_layout else ""
     if native_scale_m16:
         v2out_tag += "_ns16"
-    # BM16 MXFP8 reduces K partitions only for live output rows, directly
-    # before activation/quantization, instead of replicating the reduction
-    # and CShuffle across all K groups.
-    gui_kwave_fused = (
-        tile_m == 16
-        and a_dtype == "fp8"
-        and b_dtype == "fp8"
-        and gate_up_interleave
-        and k_wave > 1
-        and need_quant
-        and not enable_bias
-        and not is_splitk
-    )
-    if gui_kwave_fused:
-        kw_tag += "_qreduce"
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -2005,7 +1990,7 @@ def compile_mixed_moe_gemm1_common(
                     k_wave > 1
                     and not enable_bias
                     and not is_splitk
-                    and (not gate_up_interleave or gui_kwave_fused)
+                    and not gate_up_interleave
                     and need_quant
                 )
 
@@ -2122,7 +2107,7 @@ def compile_mixed_moe_gemm1_common(
                                 )
                                 acc_up[aidx] = acc_up[aidx] + bsplat
 
-                if const_expr(gate_up_interleave and not is_splitk and not kwave_fused):
+                if const_expr(gate_up_interleave and not is_splitk):
                     gui_out_n = num_acc_n // pack_N
                     acc = [None] * (gui_out_n * m_repeat)
                     for mi in range_constexpr(m_repeat):
@@ -2463,8 +2448,7 @@ def compile_mixed_moe_gemm1_common(
                                 row_i32_s = fx.Int32(row)
                                 col_s_i32 = col_g0_i32 >> c5_i32
                                 if const_expr(native_scale_m16):
-                                    # BM16 v2 GEMM2 reads opselA=0/2 from
-                                    # one scale chunk per sort block.
+                                    # One 32-row scale chunk per BM16 sort block.
                                     d0 = row_i32_s >> c4_i32
                                     d1 = c0_i32
                                 else:
@@ -2534,16 +2518,10 @@ def compile_mixed_moe_gemm1_common(
                 )
 
                 if const_expr(kwave_fused):
-                    fused_tile_n = tile_n // 2 if gate_up_interleave else tile_n
-                    fused_acc_n = num_acc_n // 2 if gate_up_interleave else num_acc_n
-                    fused_n_base = (
-                        n_tile_base // 2 if gate_up_interleave else n_tile_base
-                    )
-                    fused_by_n = by_n // 2 if gate_up_interleave else by_n
-                    slab_n = tile_m * fused_tile_n
+                    slab_n = tile_m * tile_n
                     gate_slab = fx.recast_iter(fx.Float32, base_ptr_pong)
                     up_slab = fx.recast_iter(fx.Float32, base_ptr_ping)
-                    c_tn = arith.constant(fused_tile_n, index=True)
+                    c_tn = arith.constant(tile_n, index=True)
                     c_slabn = arith.constant(slab_n, index=True)
                     kg_base = wave_k_id * c_slabn
                     vecev_f32 = T.vec(e_vec, f32)
@@ -2552,20 +2530,15 @@ def compile_mixed_moe_gemm1_common(
 
                     def fused_write(mi, ii, row_in_tile, row):
                         rb = row_in_tile * c_tn
-                        for ni in range_constexpr(fused_acc_n):
+                        for ni in range_constexpr(num_acc_n):
                             col = (
-                                fused_n_base
+                                n_tile_base
                                 + lane_mod_16
                                 + arith.constant(ni * 16, index=True)
                             )
-                            if const_expr(gate_up_interleave):
-                                aidx = mi * num_acc_n + ni * 2
-                                gv = fx.Vector(acc_gate[aidx])[ii]
-                                uv = fx.Vector(acc_gate[aidx + 1])[ii]
-                            else:
-                                aidx = mi * num_acc_n + ni
-                                gv = fx.Vector(acc_gate[aidx])[ii]
-                                uv = fx.Vector(acc_up[aidx])[ii]
+                            aidx = mi * num_acc_n + ni
+                            gv = fx.Vector(acc_gate[aidx])[ii]
+                            uv = fx.Vector(acc_up[aidx])[ii]
                             idx = kg_base + rb + col
                             fx.ptr_store(
                                 fx.Vector.from_elements([gv], fx.Float32),
@@ -2584,21 +2557,19 @@ def compile_mixed_moe_gemm1_common(
                     )
                     gpu.barrier()
 
-                    cn = min(32, fused_tile_n // int(e_vec))
-                    cm = min(int(tile_m), int(total_threads) // cn)
+                    cn = int(cshuffle_nlane)
+                    cm = int(total_threads) // cn
                     mreps = int(tile_m) // cm
-                    nreps = fused_tile_n // (cn * int(e_vec))
+                    nreps = int(tile_n) // (cn * int(e_vec))
                     c_cn = arith.constant(cn, index=True)
                     c_ev = arith.constant(e_vec, index=True)
-                    m_lane = (tx // c_cn) % arith.constant(cm, index=True)
+                    m_lane = tx / c_cn
                     n_lane = tx % c_cn
                     for mr in range_constexpr(mreps):
                         _row_local = arith.constant(mr * cm, index=True) + m_lane
                         row = bx_m + _row_local
                         # Unpack unconditionally (a Python `if` becomes scf.if and loses the binding).
                         rc, rp = precompute_row(row_local=_row_local, row=row)
-                        if const_expr(cm * cn < total_threads):
-                            rp = rp & (fx.Index(tx) < fx.Index(cm * cn))
 
                         def fused_read(_row_local=_row_local, row=row, rc=rc):
                             rb = _row_local * c_tn
@@ -2631,18 +2602,13 @@ def compile_mixed_moe_gemm1_common(
                                     act_elem(gsum[e], usum[e])
                                     for e in range_constexpr(int(e_vec))
                                 ]
-                                if const_expr(gate_up_interleave and apply_weight):
-                                    tw = buffer_ops.buffer_load(
-                                        sorted_w_rsrc, row, vec_width=1, dtype=f32
-                                    )
-                                    fe = [v * tw for v in fe]
                                 frag = fx.Vector.from_elements(fe, f32_t)
                                 store_pair(
                                     row_local=_row_local,
                                     row=row,
                                     row_ctx=rc,
                                     col_pair0=cp0,
-                                    col_g0=fused_by_n + cp0,
+                                    col_g0=by_n + cp0,
                                     frag=frag,
                                 )
 

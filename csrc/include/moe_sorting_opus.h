@@ -1153,6 +1153,161 @@ struct MoeSortingKernel
     }
 };
 
+// One bit per route keeps the small-batch scoreboard compact and preserves input order.
+struct MoeSortingBitsetKernel
+    : MoeSortingKernel<MoeSortingProblemEx<opus::index_t, float, 1, true, false, false>>
+{
+    static constexpr int kMaxExperts     = kBlockSize;
+    static constexpr int kMaxRoutes      = 2 * kBlockSize;
+    static constexpr int kMaxBitsetWords = 2048; // 8 KiB scoreboard.
+    static constexpr int kMaxPaddedRows  = 8192; // 64 KiB of sorted ids and weights.
+
+    OPUS_H static bool IsPreferred(const Hargs& h)
+    {
+        if(h.num_experts <= 0 || h.num_experts > kMaxExperts || h.topk <= 0 ||
+           h.topk > h.num_experts || h.topk >= 256 || h.tokens <= 0 || h.tokens > kMaxRoutes / h.topk || h.unit_size <= 0)
+            return false;
+        const int routes = h.tokens * h.topk;
+        const int words  = (routes + 31) / 32;
+        const auto padded_rows =
+            routes +
+            static_cast<opus::long_index_t>(min(routes, h.num_experts)) * (h.unit_size - 1);
+        return h.num_experts * words <= kMaxBitsetWords && padded_rows <= kMaxPaddedRows;
+    }
+
+    OPUS_H static auto GetSmemSize(const Hargs& h)
+    {
+        const int words = (h.tokens * h.topk + 31) / 32;
+        return (h.num_experts * (words + 2) + 1) * sizeof(opus::index_t);
+    }
+
+    OPUS_H static auto GridSize(const Hargs& h)
+    {
+        const auto bytes =
+            static_cast<opus::long_index_t>(h.tokens) * h.moe_buf_interm_dim * h.moe_buf_elem_bytes;
+        return 1 + min(get_num_cu() * OCCUPANCY - 1,
+                       static_cast<int>((bytes + kBlockSize * 16 - 1) / (kBlockSize * 16)));
+    }
+
+    OPUS_D void operator()(Kargs k) const
+    {
+        if(blockIdx.x > 0)
+        {
+            if(k.p_moe_buf)
+                moe_buf_set_zero_kernel_2d(
+                    k.p_moe_buf, k.tokens, k.moe_buf_interm_dim, k.moe_buf_elem_bytes);
+            return;
+        }
+
+        extern __shared__ char smem[];
+        auto* counts         = reinterpret_cast<opus::index_t*>(smem);
+        auto* offsets        = counts + k.num_experts;
+        auto* bits           = reinterpret_cast<unsigned*>(offsets + k.num_experts + 1);
+        const int tid        = threadIdx.x;
+        const int topk       = k.topk_mdiv.divisor;
+        const int routes     = k.tokens * topk;
+        const int words      = (routes + 31) / 32;
+        const auto* ids      = static_cast<const opus::index_t*>(k.p_topk_ids);
+        const auto* weights  = static_cast<const float*>(k.p_weights);
+        auto* sorted_ids     = static_cast<opus::index_t*>(k.p_sorted_token_ids);
+        auto* sorted_weights = static_cast<float*>(k.p_sorted_weights);
+        auto* sorted_experts = static_cast<opus::index_t*>(k.p_sorted_expert_ids);
+        auto* m_indices      = static_cast<opus::index_t*>(k.p_m_indices);
+        auto* reverse        = static_cast<opus::index_t*>(k.p_reverse_sorted);
+
+        for(int i = tid; i < k.num_experts * words; i += kBlockSize)
+            bits[i] = 0;
+        __syncthreads();
+        for(int i = tid; i < routes; i += kBlockSize)
+        {
+            const int e = ids[i];
+            if(static_cast<unsigned>(e) < k.num_experts)
+                atomicOr(bits + (i / 32) * k.num_experts + e, 1u << (i % 32));
+        }
+        __syncthreads();
+        if(tid < k.num_experts)
+        {
+            int count = 0;
+            for(int word = 0; word < words; ++word)
+                count += __popc(bits[word * k.num_experts + tid]);
+            counts[tid] = count;
+        }
+        __syncthreads();
+
+        constexpr int wave_size = opus::get_warp_size();
+        if(tid < wave_size)
+        {
+            int carry = 0;
+            for(int base = 0; base < k.num_experts; base += wave_size)
+            {
+                const int e      = base + tid;
+                const int count  = e < k.num_experts ? counts[e] : 0;
+                const int padded = k.unit_size_mdiv.div(count + k.unit_size_mdiv.divisor - 1) *
+                                   k.unit_size_mdiv.divisor;
+                int sum = padded;
+                wave_cumsum<int, wave_size>(sum);
+                if(e < k.num_experts)
+                    offsets[e] = carry + sum - padded;
+                carry += __shfl(sum, wave_size - 1);
+            }
+            if(tid == 0)
+            {
+                offsets[k.num_experts] = carry;
+                auto* valid            = static_cast<opus::index_t*>(k.p_total_tokens_post_pad);
+                valid[0]               = carry;
+                valid[1]               = k.tokens;
+            }
+        }
+        __syncthreads();
+
+        if(tid < k.num_experts)
+        {
+            const int begin = offsets[tid];
+            const int end   = offsets[tid + 1];
+            for(int pos = begin; pos < end; pos += k.unit_size_mdiv.divisor)
+                sorted_experts[k.unit_size_mdiv.div(pos)] = tid;
+        }
+        for(int pos = tid; pos < offsets[k.num_experts]; pos += kBlockSize)
+        {
+#if OPUS_MOE_SORTING_MOCK_ID
+            sorted_ids[pos] = MOE_SORTING_MOCK_ID(k.tokens, topk);
+#else
+            sorted_ids[pos] = k.tokens;
+#endif
+            sorted_weights[pos] = 0;
+            if(m_indices)
+                m_indices[pos] = k.tokens;
+        }
+        __syncthreads();
+
+        for(int i = tid; i < routes; i += kBlockSize)
+        {
+            const int e = ids[i];
+            if(static_cast<unsigned>(e) < k.num_experts)
+            {
+                int pos = offsets[e];
+                for(int word = 0; word < i / 32; ++word)
+                    pos += __popc(bits[word * k.num_experts + e]);
+                pos += __popc(bits[(i / 32) * k.num_experts + e] & ((1u << (i % 32)) - 1));
+                uint32_t token, slot;
+                k.topk_mdiv.divmod(i, token, slot);
+#if OPUS_MOE_SORTING_MOCK_ID
+                sorted_ids[pos] = MOE_SORTING_MOCK_ID(token, slot);
+#else
+                sorted_ids[pos] = token;
+#endif
+                sorted_weights[pos] = weights[i];
+                if(m_indices)
+                    m_indices[pos] = token;
+                if(reverse)
+                    reverse[i] = pos;
+            }
+            else if(reverse)
+                reverse[i] = -1;
+        }
+    }
+};
+
 namespace impl {
 
 // [expert, padded_tokens]
@@ -3561,6 +3716,17 @@ moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::strea
 {
     if(t.weight_type == "fp32" && t.index_type == "i32")
     {
+        using bitset = aiter::MoeSortingBitsetKernel;
+        if(t.dispatch_policy == 0 && !t.local_expert_masking && a.p_local_tokens == nullptr &&
+           a.p_local_topk_ids == nullptr && bitset::IsPreferred(a))
+        {
+            return aiter::launch_kernel(s,
+                                        aiter::make_kernel(bitset{},
+                                                           dim3(bitset::GridSize(a)),
+                                                           dim3(bitset::kBlockSize),
+                                                           bitset::GetSmemSize(a),
+                                                           bitset::MakeKargs(a)));
+        }
         if(moe_sorting_opus_get_workspace_size(
                a.tokens, a.num_experts, a.topk, t.dispatch_policy) != 0)
         {
