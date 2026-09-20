@@ -416,7 +416,7 @@ class _BLoader(NamedTuple):
     col: Callable  # col(*n_terms) -> _BCol for one 16-wide N block
     col_pair: Callable  # col_pair(*n_terms, shift=) -> (_BCol, _BCol) gate|up pair
     load_raw: Callable  # load_raw(base_k, col) -> per-K-step raw fragments
-    load_scale: Callable  # load_scale(base_k, col) -> per-K-step f32 scales
+    load_scale: Callable  # load_scale(base_k, col) -> per-K-step scale operands
     upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
 
 
@@ -434,6 +434,7 @@ def make_b_loader(
     w_dtype,
     b_cache_mod,
     use_k16,
+    defer_fp4_scale=False,
 ):
     """Build the shared B (weight) operand path for gemm1 and gemm2.
 
@@ -454,6 +455,9 @@ def make_b_loader(
 
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
+
+    ``defer_fp4_scale`` keeps prefetched FP4 scales packed until ``upconvert`` so
+    their expanded f32 values do not stay live across the current tile's MFMAs.
 
     Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
     gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``.
@@ -720,9 +724,12 @@ def make_b_loader(
             packed = cache[_k0_blk]
             byte_even = k_pack_sub * fx.Int32(2)
             byte_odd = byte_even + fx.Int32(1)
-            se = _e8m0_byte_to_f32(packed, byte_even)
-            so = _e8m0_byte_to_f32(packed, byte_odd)
-            scales.append((n_pack == fx.Int32(0)).select(se, so))
+            if const_expr(defer_fp4_scale):
+                scales.append((packed, byte_even, byte_odd, n_pack))
+            else:
+                se = _e8m0_byte_to_f32(packed, byte_even)
+                so = _e8m0_byte_to_f32(packed, byte_odd)
+                scales.append((n_pack == fx.Int32(0)).select(se, so))
         return scales
 
     def load_b_scale_int4(base_k, n_full):
@@ -754,6 +761,11 @@ def make_b_loader(
                 fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
             )
         # raw[ku//4][ku%4] i32 holds 8 fp4 -> 4x cvt (v2bf16, sel 0..3) -> v8bf16.
+        if const_expr(defer_fp4_scale):
+            packed, byte_even, byte_odd, n_pack = scale_f32
+            se = _e8m0_byte_to_f32(packed, byte_even)
+            so = _e8m0_byte_to_f32(packed, byte_odd)
+            scale_f32 = (n_pack == fx.Int32(0)).select(se, so)
         s_raw = _raw(scale_f32)
         i32s = []
         for sel in range_constexpr(4):

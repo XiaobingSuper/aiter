@@ -128,6 +128,7 @@ def _gemm1_body_a16w4(
         w_dtype=w_dtype,
         b_cache_mod=b_cache_mod,
         use_k16=use_k16,
+        defer_fp4_scale=True,
     )
     # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
