@@ -166,7 +166,10 @@ def _gemm1_body_a16w4(
         lane_div_16=lane_div_16,
         lane_mod_16=lane_mod_16,
         swizzle=False,
-        mfma_lane_layout=(BM == 16 and not use_k16 and TILE_K % 128 == 0),
+        # K128 tiles retain linear staging; the lane layout regresses narrow N tiles.
+        mfma_lane_layout=(
+            BM == 16 and not use_k16 and TILE_K >= 256 and TILE_K % 128 == 0
+        ),
         a_ptr=arg_x,
         a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
         a_load_threads=a_load_threads,
