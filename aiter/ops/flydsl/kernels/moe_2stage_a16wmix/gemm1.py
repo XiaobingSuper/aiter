@@ -79,6 +79,8 @@ def _gemm1_body_a16w4(
     if const_expr(k_wave > 1):
         wave_n_id = wave % fx.Int32(num_n_waves)
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
+        # Preserve the power-of-two K-wave range after readfirstlane for address folding.
+        wave_k_id = wave_k_id & fx.Int32(k_wave - 1)
     else:
         wave_n_id = wave
         wave_k_id = fx.Int32(0)
@@ -139,8 +141,8 @@ def _gemm1_body_a16w4(
 
     # ---- A path (shared with gemm2, see utils.make_a_loader) -------------------
     # a_load_threads (256 at k_wave=1) cooperatively stage one k-group's BM x TILE_K bf16
-    # tile into LDS; stage1's A-LDS is carved into k_wave groups x 2 pipeline slots, and
-    # is NOT XOR-swizzled (its DMA source is already conflict-free).
+    # tile into LDS; stage1's A-LDS is carved into k_wave groups x 2 pipeline slots.
+    # Map BM16 K32-MFMA fragments to lanes to avoid LDS read bank conflicts.
     c_k_div4 = (K * elem_bytes) // 4
 
     def _a_row_base_dwords(row_local):
@@ -164,6 +166,7 @@ def _gemm1_body_a16w4(
         lane_div_16=lane_div_16,
         lane_mod_16=lane_mod_16,
         swizzle=False,
+        mfma_lane_layout=(BM == 16 and not use_k16 and TILE_K % 128 == 0),
         a_ptr=arg_x,
         a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
         a_load_threads=a_load_threads,
@@ -239,10 +242,10 @@ def _gemm1_body_a16w4(
     # One K tile of BOTH operands as a single value: the software pipeline below keeps
     # tile kt+1 in flight while kt runs its MFMAs, so it has to carry them together.
     def load_b_tile(base_k):
-        g_sc = [b_loader.load_scale(base_k, c) for c in cols_gate]
-        u_sc = [b_loader.load_scale(base_k, c) for c in cols_up]
         g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
         u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
+        g_sc = [b_loader.load_scale(base_k, c) for c in cols_gate]
+        u_sc = [b_loader.load_scale(base_k, c) for c in cols_up]
         return g_raw, u_raw, g_sc, u_sc
 
     def preload_a(read_slot):
@@ -257,8 +260,8 @@ def _gemm1_body_a16w4(
     def compute_tile(b_tile, a_frags):
         # Accumulators are the enclosing rmem tensors, mutated in place.
         g_raw, u_raw, g_sc, u_sc = b_tile
-        for ni in range_constexpr(num_acc_n):
-            for ku in range_constexpr(k_unroll):
+        for ku in range_constexpr(k_unroll):
+            for ni in range_constexpr(num_acc_n):
                 gb = b_loader.upconvert(g_raw[ni], ku, g_sc[ni][ku])
                 ub = b_loader.upconvert(u_raw[ni], ku, u_sc[ni][ku])
                 for mi in range_constexpr(m_repeat):
