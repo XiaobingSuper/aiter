@@ -91,9 +91,8 @@ def _gemm1_body_a16w4(
     # A load is group-local: num_n_waves*64 threads load each k-group's BM x TILE_K tile.
     a_load_threads = num_n_waves * 64
     k_blocks16 = KH_TILE_BYTES // 16
-    # Software pipeline (aiter-aligned): A-LDS double-buffered (tile K+1 DMA -> pong while
-    # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
-    # completes on lgkmcnt, so only rocdl.s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
+    # Double-buffer A-LDS and issue the next tile's B + scale loads before this tile's
+    # MFMAs. LLVM inserts the vmcnt waits required by direct-to-LDS loads.
     _PIPE = K_TILES_TOTAL > 1
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
@@ -289,7 +288,7 @@ def _gemm1_body_a16w4(
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
             cur_slot = kt % A_LDS_STAGES
-            # Wait only THIS tile's A DMA (lgkmcnt); B's vmem stays in flight.
+            # Synchronize the staged A tile before reading its LDS slot.
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()  # single barrier: A(kt) visible before ds_read
             # Phase-separated: read resident A-LDS, THEN issue kt+1's A-DMA + B/B-scale
