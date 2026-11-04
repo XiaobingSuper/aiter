@@ -27,7 +27,7 @@ namespace aiter {
 // device properties, and this sits on the launch path of every quant call.
 static inline bool dyn_gq_tuned_arch()
 {
-    static const bool tuned = (get_gpu_arch() == "gfx1250");
+    static const bool tuned = ((get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"));
     return tuned;
 }
 
@@ -115,7 +115,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // apart -- one byte per cache line, measured at 4.8 us (15% of the kernel) to move
     // 0.9 MB. Column-major makes that store contiguous and strides the data reads instead,
     // but each group still reads one contiguous 256B run. Net: 36.3 -> 32.0 us.
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool kTunedForThisArch = true;
 #else
     static constexpr bool kTunedForThisArch = false;
@@ -150,7 +150,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
         (block_size % WARP_SIZE) == 0;
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // One descriptor per BLOCK: the tile is every wave's rows at once. tensorcnt retires
     // per wave, so only the issuer can wait and the rest need a barrier -- half the
     // descriptors and a 2x wider tile against two barriers per stage.
@@ -164,7 +164,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // All four lanes of a group share a group id, hence the same (x, y), so the DPP reduce
     // below never reads across an active/inactive lane boundary.
     auto resolve = [&](int64_t gid, int64_t& gx, int32_t& gy) -> bool {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         if constexpr(grid_2d)
         {
             static_assert(kColumnMajorGroups && group_size == 128);
@@ -185,7 +185,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
         if constexpr(kColumnMajorGroups)
         {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
             if constexpr(kTiledTdm)
             {
                 constexpr int kTileCols = kTdmGroupsPerBlock / kTileRows;
@@ -553,7 +553,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
     };   // process
 
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     if constexpr(kUseTdmShape)
     {
         // Wave 0 stages the block's groups into shared LDS. It waits on tensorcnt;
@@ -1200,6 +1200,134 @@ dynamic_per_token_scaled_quant_rows4_kernel(opus::fp8_t* __restrict__ out,
     }
 }
 
+
+template <int TileRows, int BlockThreads>
+__global__ __launch_bounds__(BlockThreads) void
+dynamic_per_token_scaled_quant_tdm_padded_rows_kernel(
+    opus::fp8_t* __restrict__ out,
+    float* __restrict__ scale,
+    const opus::bf16_t* __restrict__ input,
+    int32_t rows)
+{
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    constexpr int32_t cols = 1024;
+    constexpr int32_t half_cols = 512;
+    constexpr int32_t elems_per_vec = 16;
+    constexpr int32_t waves = BlockThreads / WARP_SIZE;
+    using vec_i = opus::vector_t<opus::bf16_t, elems_per_vec>;
+    using vec_o = opus::vector_t<opus::fp8_t, elems_per_vec>;
+    using Padding =
+        opus::tdm_traits::padding_auto<opus::bf16_t, half_cols, 16>;
+    using TdmHalf = opus::tdm<
+        opus::bf16_t, opus::seq<half_cols, TileRows>, Padding>;
+    constexpr int32_t lds_pitch = Padding::pitch_elements;
+    constexpr int32_t half_tile_elems = TileRows * lds_pitch;
+
+    __shared__ opus::bf16_t tdm_lds[2 * half_tile_elems];
+    const int32_t base_row = blockIdx.x * TileRows;
+    const bool issuer = threadIdx.x < WARP_SIZE;
+    auto first = opus::make_tdm<TdmHalf>(
+        static_cast<u32_t>(reinterpret_cast<u64_t>(tdm_lds)),
+        input,
+        static_cast<u32_t>(cols),
+        static_cast<u32_t>(rows),
+        static_cast<u64_t>(cols),
+        0,
+        static_cast<u32_t>(base_row));
+    auto second = opus::make_tdm<TdmHalf>(
+        static_cast<u32_t>(reinterpret_cast<u64_t>(tdm_lds)),
+        input,
+        static_cast<u32_t>(cols),
+        static_cast<u32_t>(rows),
+        static_cast<u64_t>(cols),
+        static_cast<u32_t>(half_cols),
+        static_cast<u32_t>(base_row));
+    if(issuer)
+    {
+        first.async_load(0);
+        second.async_load(half_tile_elems);
+        opus::s_wait_tensorcnt<0>();
+    }
+    __builtin_amdgcn_s_barrier();
+
+    const int32_t wave = threadIdx.x / WARP_SIZE;
+    const int32_t lane = threadIdx.x % WARP_SIZE;
+#pragma unroll
+    for(int32_t local_row = wave; local_row < TileRows;
+        local_row += waves)
+    {
+        const int32_t row = base_row + local_row;
+        const bool row_live = row < rows;
+        vec_i values[2];
+        values[0] = reinterpret_cast<const vec_i*>(
+            tdm_lds + local_row * lds_pitch)[lane];
+        values[1] = reinterpret_cast<const vec_i*>(
+            tdm_lds + half_tile_elems + local_row * lds_pitch)[lane];
+
+        float abs_max = 0.0f;
+        bool thread_has_nan = false;
+#pragma unroll
+        for(int32_t i = 0; i < 2; ++i)
+        {
+            const auto packed = __builtin_bit_cast(
+                opus::vector_t<uint32_t, elems_per_vec / 2>, values[i]);
+            uint32_t packed_max = 0;
+#pragma unroll
+            for(int32_t j = 0; j < elems_per_vec / 2; ++j)
+            {
+                const uint32_t pair = packed[j] & 0x7fff7fffU;
+                asm("v_pk_max_u16 %0, %1, %2"
+                    : "=v"(packed_max)
+                    : "v"(packed_max), "v"(pair));
+            }
+            const uint32_t magnitude =
+                opus::max(packed_max & 0xffffU, packed_max >> 16);
+            if(magnitude <= 0x7f80U)
+                abs_max = max(
+                    abs_max,
+                    __builtin_bit_cast(float, magnitude << 16));
+            else
+            {
+                thread_has_nan = true;
+#pragma unroll
+                for(int32_t j = 0; j < elems_per_vec; ++j)
+                    abs_max = max(
+                        abs_max, abs(static_cast<float>(values[i][j])));
+            }
+        }
+#pragma unroll
+        for(int32_t offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+            abs_max = max(
+                abs_max, __shfl_xor(abs_max, offset, WARP_SIZE));
+        const float row_scale =
+            abs_max *
+            (1.0f /
+             static_cast<float>(opus::finfo<opus::fp8_t>::max()));
+        if(lane == 0 && row_live)
+            scale[row] = row_scale;
+        if(!row_live)
+            continue;
+
+        const float inverted_scale = __builtin_amdgcn_rcpf(row_scale);
+        auto* output_vecs = reinterpret_cast<vec_o*>(
+            out + static_cast<int64_t>(row) * cols);
+#pragma unroll
+        for(int32_t i = 0; i < 2; ++i)
+        {
+            vec_o converted;
+            if(!thread_has_nan && row_scale > 0.0f &&
+               row_scale < __builtin_inff())
+                converted = bf16_to_fp8_scaled_no_clamp<elems_per_vec>(
+                    values[i], inverted_scale);
+            else
+                converted =
+                    scaled_cast<opus::fp8_t>(values[i], inverted_scale);
+            output_vecs[lane + i * WARP_SIZE] = converted;
+        }
+    }
+#endif
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
 __device__ std::tuple<float, float*>
 smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
@@ -1300,7 +1428,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                 opus::s_wait_loadcnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
@@ -1687,7 +1815,21 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
             dyn_gq_tuned_arch() && input.dtype() == AITER_DTYPE_bf16
             && out.dtype() == AITER_DTYPE_fp8 && rows >= 1024 && cols <= 2048
             && cols % 128 == 0 && num_rows_ptr == nullptr;
-        if(use_gfx1250_narrow_block && cols == 1024 && rows > 4096)
+        // Tiled tensor loads amortize descriptor and barrier cost only for large
+        // K=1024 row sets. Eight padded rows avoid the LDS bank conflicts of
+        // the earlier contiguous ring layout.
+        const bool use_gfx1250_tdm_rows =
+            dyn_gq_tuned_arch() && input.dtype() == AITER_DTYPE_bf16
+            && out.dtype() == AITER_DTYPE_fp8 && num_rows_ptr == nullptr
+            && cols == 1024 && rows >= 16384;
+        if(use_gfx1250_tdm_rows)
+            dynamic_per_token_scaled_quant_tdm_padded_rows_kernel<
+                8, 256><<<dim3((rows + 7) / 8), dim3(256), 0, stream>>>(
+                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+                reinterpret_cast<float*>(scales.data_ptr()),
+                reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
+                rows);
+        else if(use_gfx1250_narrow_block && cols == 1024 && rows > 4096)
             dynamic_per_token_scaled_quant_rows4_kernel<1><<<
                 dim3((rows + 3) / 4), dim3(256), 0, stream>>>(
                 reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
@@ -1738,7 +1880,7 @@ dynamic_per_group_quant_m32k4_kernel(std::conditional_t<std::is_same_v<DTYPE_O, 
     using vec_o = std::conditional_t<kFp4,
                                      opus::vector_t<uint8_t, kElems / 2>,
                                      opus::vector_t<opus::fp8_t, kElems>>;
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     // The hardware divide-by-scale convert is the fp8 path's; fp4 casts through scaled_cast.
     static constexpr bool kHwConvertDiv = !kFp4 && std::is_same_v<DTYPE_I, opus::bf16_t>;
 #else
@@ -2466,7 +2608,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
 #else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
