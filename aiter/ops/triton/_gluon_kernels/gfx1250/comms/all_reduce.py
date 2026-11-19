@@ -3,13 +3,15 @@ into the inbox of each peer as 16-byte lines of 2 units [value, value, value, ta
 receiver waits until its lines carry the tag of the call, then adds the 4 chunks. Even
 and odd calls use 2 banks of the inbox: a GPU can be one call ahead of a peer.
 
-With NORM, the kernel also adds the residual and applies RMSNorm (and per-token FP8
-quant) to its rows. A row is then cdiv(HIDDEN, 384) chunks; the last one is partial and
-its lines past the row carry 0. A program runs W waves (a power of 2, at least
-HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes one row, 2 chunks
-a wave. For HIDDEN 6144 (W 8), these 768 values are those of one wave of the HIP
-add_rmsnorm_quant kernel, and the waves add and compare their results through LDS in
-the order of that kernel. So the results have the same bits."""
+_all_reduce_rmsnorm_kernel is the same all-reduce of rows that then adds the
+residual and applies RMSNorm, optionally followed by per-token FP8 or native
+group-32 MXFP8 quantization. A row is cdiv(HIDDEN, 384) chunks; the last one is
+partial and its lines past the row carry 0. A program runs W waves (a power of
+2, at least HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes
+one row, 2 chunks a wave. For HIDDEN 6144 (W 8), these 768 values are those of
+one wave of the HIP add_rmsnorm_quant kernel, and the waves add and compare
+their results through LDS in the order of that kernel. So the results have the
+same bits."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -247,6 +249,50 @@ def _asm(op: gl.constexpr, v):
 
 
 @gluon.jit
+def _mxfp8_quant_store(
+    y,
+    out,
+    scale,
+    at,
+    local,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+):
+    """Store one contiguous 128-value plane as native group-32 MXFP8."""
+    y = _wave_units(y.to(gl.bfloat16).to(gl.float32))
+    at = _wave_units(at)
+    mask = gl.broadcast(mask, local)[0]
+    local = _wave_units(local)
+    mask = _wave_units(mask)
+
+    W: gl.constexpr = gl.num_warps()
+    groups = gl.reshape(y, [4 * W, 32])
+    amax = gl.maximum(gl.max(gl.abs(groups), axis=1), 1e-10)
+    scaled = amax * (1.0 / 448.0)
+    bits = scaled.to(gl.uint32, bitcast=True)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
+    reciprocal = (gl.maximum(254 - code.to(gl.int32), 0) << 23).to(
+        gl.float32, bitcast=True
+    )
+    reciprocal = gl.reshape(
+        gl.broadcast(reciprocal[:, None], groups)[0],
+        [W, 128],
+    )
+    q = gl.clamp(y * reciprocal, -448.0, 448.0).to(gl.float8e4nv)
+    gl.amd.cdna5.buffer_store(q, out, at, mask=mask)
+
+    code = gl.reshape(gl.broadcast(code[:, None], groups)[0], [W, 128]).to(gl.uint8)
+    group_at = row * (HIDDEN // 32) + local // 32
+    gl.amd.cdna5.buffer_store(
+        code,
+        scale,
+        group_at,
+        mask=mask & (local % 32 == 0),
+    )
+
+
+@gluon.jit
 def _wave_units(p):
     """Plane p [rows, 2] of the waves as [wave, unit] (see _wave_lines)."""
     W: gl.constexpr = gl.num_warps()
@@ -372,9 +418,11 @@ def _receive_norm(
 ):
     """Receives one row: wave w takes slab w (chunks 2w and 2w + 1 of the row; the
     values past the row are masked). Then stores residual_out = the sum + residual and
-    out = RMSNorm(residual_out) as bf16 (NORM 1) or as per-token FP8 with its fp32
-    scale (NORM 2). The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>,
-    and for FP8 then that of the per-token quant of its bf16 out."""
+    out = RMSNorm(residual_out) as bf16 (NORM 1), per-token FP8 with its fp32
+    scale (NORM 2), or E4M3 with row-major group-32 E8M0 scales (NORM 3).
+    The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>; quantization
+    reads the BF16 norm result, matching the corresponding standalone quantizer.
+    """
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
@@ -388,28 +436,28 @@ def _receive_norm(
     wb = wa + 6 * LINES  # and of chunk k + 1 at wb + 2 LINES j
     va = row * HIDDEN + wa
     vb = row * HIDDEN + wb
-    m0, m1, m2 = _planes(k, line, HIDDEN, LINES)
-    m3, m4, m5 = _planes(k + 1, line, HIDDEN, LINES)
+    # The 6 planes of the slab: their values, their columns in the row, their masks.
+    at = (va, va + 2 * LINES, va + 4 * LINES, vb, vb + 2 * LINES, vb + 4 * LINES)
+    cols = (wa, wa + 2 * LINES, wa + 4 * LINES, wb, wb + 2 * LINES, wb + 4 * LINES)
+    masks = _planes(k, line, HIDDEN, LINES) + _planes(k + 1, line, HIDDEN, LINES)
     # The residual and the weight are local: load them before the wait.
-    r0 = gl.amd.cdna5.buffer_load(residual, va, mask=m0, other=0)
-    r1 = gl.amd.cdna5.buffer_load(residual, va + 2 * LINES, mask=m1, other=0)
-    r2 = gl.amd.cdna5.buffer_load(residual, va + 4 * LINES, mask=m2, other=0)
-    r3 = gl.amd.cdna5.buffer_load(residual, vb, mask=m3, other=0)
-    r4 = gl.amd.cdna5.buffer_load(residual, vb + 2 * LINES, mask=m4, other=0)
-    r5 = gl.amd.cdna5.buffer_load(residual, vb + 4 * LINES, mask=m5, other=0)
-    w0 = gl.amd.cdna5.buffer_load(weight, wa, mask=m0, other=0)
-    w1 = gl.amd.cdna5.buffer_load(weight, wa + 2 * LINES, mask=m1, other=0)
-    w2 = gl.amd.cdna5.buffer_load(weight, wa + 4 * LINES, mask=m2, other=0)
-    w3 = gl.amd.cdna5.buffer_load(weight, wb, mask=m3, other=0)
-    w4 = gl.amd.cdna5.buffer_load(weight, wb + 2 * LINES, mask=m4, other=0)
-    w5 = gl.amd.cdna5.buffer_load(weight, wb + 4 * LINES, mask=m5, other=0)
+    res = ()
+    for j in gl.static_range(6):
+        res += (gl.amd.cdna5.buffer_load(residual, at[j], mask=masks[j], other=0),)
+    w = ()
+    for j in gl.static_range(6):
+        w += (gl.amd.cdna5.buffer_load(weight, cols[j], mask=masks[j], other=0),)
     ok_a = k < ROW
     ok_b = k + 1 < ROW
-    call_a, mine_a = _lines(x, va, m0, m1, m2, 2 * LINES, calls + 2 * c + 1, ok_a)
-    call_b, mine_b = _lines(x, vb, m3, m4, m5, 2 * LINES, calls + 2 * c + 3, ok_b)
+    call_a, mine_a = _lines(
+        x, va, masks[0], masks[1], masks[2], 2 * LINES, calls + 2 * c + 1, ok_a
+    )
+    call_b, mine_b = _lines(
+        x, vb, masks[3], masks[4], masks[5], 2 * LINES, calls + 2 * c + 3, ok_b
+    )
     wave4, line4 = _wave_lines(LINES, LINE)
     pos = 4 * ((ROW * row + 2 * wave4) * LINES + line4) + col4
-    s0, s1, s2, s3, s4, s5 = _receive_pair(
+    sums = _receive_pair(
         inboxes,
         pos,
         call_a,
@@ -424,78 +472,58 @@ def _receive_norm(
         MAXIT,
     )
     # As the split path: the all-reduce result is bf16, the residual add is fp32.
-    s0 = s0.to(gl.bfloat16).to(gl.float32) + r0.to(gl.float32)
-    s1 = s1.to(gl.bfloat16).to(gl.float32) + r1.to(gl.float32)
-    s2 = s2.to(gl.bfloat16).to(gl.float32) + r2.to(gl.float32)
-    s3 = s3.to(gl.bfloat16).to(gl.float32) + r3.to(gl.float32)
-    s4 = s4.to(gl.bfloat16).to(gl.float32) + r4.to(gl.float32)
-    s5 = s5.to(gl.bfloat16).to(gl.float32) + r5.to(gl.float32)
-    gl.amd.cdna5.buffer_store(s0.to(gl.bfloat16), residual_out, va, mask=m0)
-    gl.amd.cdna5.buffer_store(s1.to(gl.bfloat16), residual_out, va + 2 * LINES, mask=m1)
-    gl.amd.cdna5.buffer_store(s2.to(gl.bfloat16), residual_out, va + 4 * LINES, mask=m2)
-    gl.amd.cdna5.buffer_store(s3.to(gl.bfloat16), residual_out, vb, mask=m3)
-    gl.amd.cdna5.buffer_store(s4.to(gl.bfloat16), residual_out, vb + 2 * LINES, mask=m4)
-    gl.amd.cdna5.buffer_store(s5.to(gl.bfloat16), residual_out, vb + 4 * LINES, mask=m5)
+    s = ()
+    for j in gl.static_range(6):
+        s += (sums[j].to(gl.bfloat16).to(gl.float32) + res[j].to(gl.float32),)
+    for j in gl.static_range(6):
+        v = s[j].to(gl.bfloat16)
+        gl.amd.cdna5.buffer_store(v, residual_out, at[j], mask=masks[j])
 
-    sq = _square_sum(s0, s1, s2, s3, s4, s5)
+    sq = _square_sum(s[0], s[1], s[2], s[3], s[4], s[5])
     # rsqrtf(sum * rcp(n) + eps), with eps added in fp64, as add_rmsnorm_quant_kernel.
     mean = sq * _asm("v_rcp_f32", gl.full([], HIDDEN, gl.float32))
     rstd = _asm("v_rsq_f32", (mean.to(gl.float64) + EPS).to(gl.float32))
     offset: gl.constexpr = 1.0 if GEMMA else 0.0
-    y0 = s0 * rstd * (w0.to(gl.float32) + offset)
-    y1 = s1 * rstd * (w1.to(gl.float32) + offset)
-    y2 = s2 * rstd * (w2.to(gl.float32) + offset)
-    y3 = s3 * rstd * (w3.to(gl.float32) + offset)
-    y4 = s4 * rstd * (w4.to(gl.float32) + offset)
-    y5 = s5 * rstd * (w5.to(gl.float32) + offset)
+    y = ()
+    for j in gl.static_range(6):
+        y += (s[j] * rstd * (w[j].to(gl.float32) + offset),)
     if NORM == 1:
-        gl.amd.cdna5.buffer_store(y0.to(gl.bfloat16), out, va, mask=m0)
-        gl.amd.cdna5.buffer_store(y1.to(gl.bfloat16), out, va + 2 * LINES, mask=m1)
-        gl.amd.cdna5.buffer_store(y2.to(gl.bfloat16), out, va + 4 * LINES, mask=m2)
-        gl.amd.cdna5.buffer_store(y3.to(gl.bfloat16), out, vb, mask=m3)
-        gl.amd.cdna5.buffer_store(y4.to(gl.bfloat16), out, vb + 2 * LINES, mask=m4)
-        gl.amd.cdna5.buffer_store(y5.to(gl.bfloat16), out, vb + 4 * LINES, mask=m5)
-    else:
-        gl.static_assert(NORM == 2)
+        for j in gl.static_range(6):
+            gl.amd.cdna5.buffer_store(y[j].to(gl.bfloat16), out, at[j], mask=masks[j])
+    elif NORM == 2:
         # Quantize the bf16 norm output, as the split norm -> per-token quant path.
-        y0 = y0.to(gl.bfloat16).to(gl.float32)
-        y1 = y1.to(gl.bfloat16).to(gl.float32)
-        y2 = y2.to(gl.bfloat16).to(gl.float32)
-        y3 = y3.to(gl.bfloat16).to(gl.float32)
-        y4 = y4.to(gl.bfloat16).to(gl.float32)
-        y5 = y5.to(gl.bfloat16).to(gl.float32)
-        top = gl.maximum(gl.abs(y0), gl.abs(y1))
-        top = gl.maximum(top, gl.maximum(gl.abs(y2), gl.abs(y3)))
-        top = gl.maximum(top, gl.maximum(gl.abs(y4), gl.abs(y5)))
+        q = ()
+        for j in gl.static_range(6):
+            q += (y[j].to(gl.bfloat16).to(gl.float32),)
+        top = gl.maximum(gl.abs(q[0]), gl.abs(q[1]))
+        top = gl.maximum(top, gl.maximum(gl.abs(q[2]), gl.abs(q[3])))
+        top = gl.maximum(top, gl.maximum(gl.abs(q[4]), gl.abs(q[5])))
         top = gl.maximum(gl.max(gl.max(top, axis=1), axis=0), 0.0)  # max is exact
+        # Hidden 32, 64 and 128 take the group path of dynamic_per_token_scaled_quant:
+        # amax floored at kAmaxFloor (1e-10) and an IEEE reciprocal of the scale.
+        GROUP: gl.constexpr = HIDDEN == 32 or HIDDEN == 64 or HIDDEN == 128
+        if GROUP:
+            top = gl.maximum(top, 1e-10)
         row_scale = top * (1.0 / 448.0)  # 448 is the fp8 maximum
         gl.store(scale + row, row_scale)
-        inv = _asm("v_rcp_f32", row_scale)
-        q = gl.clamp(y0 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, va, mask=m0)
-        q = gl.clamp(y1 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, va + 2 * LINES, mask=m1)
-        q = gl.clamp(y2 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, va + 4 * LINES, mask=m2)
-        q = gl.clamp(y3 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, vb, mask=m3)
-        q = gl.clamp(y4 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, vb + 2 * LINES, mask=m4)
-        q = gl.clamp(y5 * inv, -448.0, 448.0).to(gl.float8e4nv)
-        gl.amd.cdna5.buffer_store(q, out, vb + 4 * LINES, mask=m5)
+        if GROUP:
+            inv = gl.div_rn(gl.full([], 1.0, gl.float32), row_scale)
+        else:
+            inv = _asm("v_rcp_f32", row_scale)
+        for j in gl.static_range(6):
+            v = gl.clamp(q[j] * inv, -448.0, 448.0).to(gl.float8e4nv)
+            gl.amd.cdna5.buffer_store(v, out, at[j], mask=masks[j])
+    else:
+        gl.static_assert(NORM == 3)
+        _mxfp8_quant_store(y[0], out, scale, at[0], cols[0], masks[0], row, HIDDEN)
+        _mxfp8_quant_store(y[1], out, scale, at[1], cols[1], masks[1], row, HIDDEN)
+        _mxfp8_quant_store(y[2], out, scale, at[2], cols[2], masks[2], row, HIDDEN)
+        _mxfp8_quant_store(y[3], out, scale, at[3], cols[3], masks[3], row, HIDDEN)
+        _mxfp8_quant_store(y[4], out, scale, at[4], cols[4], masks[4], row, HIDDEN)
+        _mxfp8_quant_store(y[5], out, scale, at[5], cols[5], masks[5], row, HIDDEN)
 
 
-_plain_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
-_norm_repr = make_kernel_repr(
-    "_all_reduce_kernel", ["RANK", "LINES", "NORM", "GEMMA", "HIDDEN"]
-)
-
-
-def _all_reduce_repr(specialization):
-    """The name of the plain kernel stays the same; NORM kernels add their keys."""
-    if specialization.constants.get("NORM", 0):
-        return _norm_repr(specialization)
-    return _plain_repr(specialization)
+_all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
 
 
 @gluon.jit(repr=_all_reduce_repr, do_not_specialize=["n", "programs"])
@@ -507,6 +535,70 @@ def _all_reduce_kernel(
     err,
     n,
     programs,
+    RANK: gl.constexpr,
+    LINES: gl.constexpr,
+    SLOT: gl.constexpr,
+    MAXIT: gl.constexpr,
+):
+    """y = the sum of the n values of x over the 4 ranks. Programs 0 to C-1 send the C
+    chunks, one each: a load after a remote store waits for its ack. Programs C to
+    C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
+    order, so a waiting receiver cannot block a sender."""
+    WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
+    num_chunks = gl.cdiv(n, 6 * LINES)
+    pid = gl.program_id(0)
+    # Unit u of a chunk has the values u, U + u and 2U + u (U = 2 LINES units), so that
+    # the loads of x are coalesced.
+    line = gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
+    pair = gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]  # 2 units a line
+    line4 = gl.arange(0, LINES, layout=gl.SliceLayout(1, LINE))[:, None]
+    col4 = gl.arange(0, 4, layout=gl.SliceLayout(0, LINE))[None, :]
+    if pid < num_chunks:
+        first = 6 * pid * LINES + 2 * line  # one mask for the 2 units of a line
+        ok1 = first + 2 * LINES < n
+        ok2 = first + 4 * LINES < n
+        call, lines = _lines(
+            x, first + pair, first < n, ok1, ok2, 2 * LINES, calls + 2 * pid
+        )
+        # All lines of the chunk, also past n: no old tag can stay.
+        pos = 4 * (pid * LINES + line4) + col4
+        _post(lines, inboxes, pos, line4 < LINES, call, RANK, SLOT)
+    else:
+        for c in range(pid - num_chunks, num_chunks, programs):
+            first = 6 * c * LINES + 2 * line
+            value = first + pair
+            ok1 = first + 2 * LINES < n
+            ok2 = first + 4 * LINES < n
+            call, lines = _lines(
+                x, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
+            )
+            pos = 4 * (c * LINES + line4) + col4
+            needed = 6 * c * LINES + 2 * line4 < n  # the line has values of x
+            s0, s1, s2 = _receive(
+                inboxes, pos, needed, call, lines, err, RANK, SLOT, MAXIT
+            )
+            s0 = s0.to(gl.bfloat16)
+            s1 = s1.to(gl.bfloat16)
+            s2 = s2.to(gl.bfloat16)
+            gl.amd.cdna5.buffer_store(s0, y, value, mask=first < n)
+            gl.amd.cdna5.buffer_store(s1, y, value + 2 * LINES, mask=ok1)
+            gl.amd.cdna5.buffer_store(s2, y, value + 4 * LINES, mask=ok2)
+
+
+_all_reduce_rmsnorm_repr = make_kernel_repr(
+    "_all_reduce_rmsnorm_kernel", ["RANK", "LINES", "NORM", "GEMMA", "HIDDEN"]
+)
+
+
+@gluon.jit(repr=_all_reduce_rmsnorm_repr, do_not_specialize=["tokens"])
+def _all_reduce_rmsnorm_kernel(
+    x,
+    residual_out,
+    inboxes,
+    calls,
+    err,
+    tokens,
     residual,
     weight,
     out,
@@ -520,81 +612,35 @@ def _all_reduce_kernel(
     GEMMA: gl.constexpr,
     EPS: gl.constexpr,
 ):
-    """y = the sum of the n values of x over the 4 ranks. Programs 0 to C-1 send the C
-    chunks, one each: a load after a remote store waits for its ack. Programs C to
-    C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
-    order, so a waiting receiver cannot block a sender.
-
-    NORM 0 ignores residual, weight, out and scale. With NORM 1 or 2, y is
-    residual_out, there are P rows of HIDDEN values, and the W-wave programs 0 to
-    S - 1 send W chunks each (S = cdiv(P cdiv(HIDDEN, 6 LINES), W)); the next programs
-    receive one row each."""
-    WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
-    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
-    num_chunks = gl.cdiv(n, 6 * LINES)
+    """_all_reduce_kernel of tokens rows of HIDDEN values, then residual_out = the sum +
+    residual and out = RMSNorm(residual_out), as bf16 (NORM 1), per-token FP8
+    (NORM 2), or native group-32 MXFP8 (NORM 3). The W-wave programs 0 to S - 1
+    send W chunks each (S = cdiv(tokens cdiv(HIDDEN, 6 LINES), W)); the next
+    programs receive one row each.
+    """
+    ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
+    senders = gl.cdiv(tokens * ROW, gl.num_warps())
     pid = gl.program_id(0)
-    if NORM > 0:
-        ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
-        senders = gl.cdiv(programs * ROW, gl.num_warps())
-        if pid < senders:
-            _send_norm(x, inboxes, calls, pid, programs, RANK, LINES, SLOT, HIDDEN)
-        else:
-            _receive_norm(
-                x,
-                residual,
-                weight,
-                out,
-                y,
-                scale,
-                inboxes,
-                calls,
-                err,
-                pid - senders,
-                RANK,
-                LINES,
-                SLOT,
-                MAXIT,
-                NORM,
-                HIDDEN,
-                GEMMA,
-                EPS,
-            )
+    if pid < senders:
+        _send_norm(x, inboxes, calls, pid, tokens, RANK, LINES, SLOT, HIDDEN)
     else:
-        # Unit u of a chunk has the values u, U + u and 2U + u (U = 2 LINES units), so that
-        # the loads of x are coalesced.
-        line = gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
-        pair = gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[
-            None, :
-        ]  # 2 units a line
-        line4 = gl.arange(0, LINES, layout=gl.SliceLayout(1, LINE))[:, None]
-        col4 = gl.arange(0, 4, layout=gl.SliceLayout(0, LINE))[None, :]
-        if pid < num_chunks:
-            first = 6 * pid * LINES + 2 * line  # one mask for the 2 units of a line
-            ok1 = first + 2 * LINES < n
-            ok2 = first + 4 * LINES < n
-            call, lines = _lines(
-                x, first + pair, first < n, ok1, ok2, 2 * LINES, calls + 2 * pid
-            )
-            # All lines of the chunk, also past n: no old tag can stay.
-            pos = 4 * (pid * LINES + line4) + col4
-            _post(lines, inboxes, pos, line4 < LINES, call, RANK, SLOT)
-        else:
-            for c in range(pid - num_chunks, num_chunks, programs):
-                first = 6 * c * LINES + 2 * line
-                value = first + pair
-                ok1 = first + 2 * LINES < n
-                ok2 = first + 4 * LINES < n
-                call, lines = _lines(
-                    x, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
-                )
-                pos = 4 * (c * LINES + line4) + col4
-                needed = 6 * c * LINES + 2 * line4 < n  # the line has values of x
-                s0, s1, s2 = _receive(
-                    inboxes, pos, needed, call, lines, err, RANK, SLOT, MAXIT
-                )
-                s0 = s0.to(gl.bfloat16)
-                s1 = s1.to(gl.bfloat16)
-                s2 = s2.to(gl.bfloat16)
-                gl.amd.cdna5.buffer_store(s0, y, value, mask=first < n)
-                gl.amd.cdna5.buffer_store(s1, y, value + 2 * LINES, mask=ok1)
-                gl.amd.cdna5.buffer_store(s2, y, value + 4 * LINES, mask=ok2)
+        _receive_norm(
+            x,
+            residual,
+            weight,
+            out,
+            residual_out,
+            scale,
+            inboxes,
+            calls,
+            err,
+            pid - senders,
+            RANK,
+            LINES,
+            SLOT,
+            MAXIT,
+            NORM,
+            HIDDEN,
+            GEMMA,
+            EPS,
+        )
