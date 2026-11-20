@@ -31,7 +31,8 @@ def norm_waves(hidden: int) -> int:
 
 
 def norm_fits(tokens: int, hidden: int, calls: torch.Tensor) -> bool:
-    """Whether the rows fit the Gluon all-reduce inbox."""
+    """Whether all_reduce_rmsnorm_per_token_quant takes tokens rows of hidden values
+    on the inboxes of these calls: a row is whole chunks, its last one partial."""
     chunks = (calls.numel() - 1) // 2
     return (
         norm_waves(hidden) > 0
@@ -116,18 +117,10 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
         calls[-1:],
         n,
         programs,
-        x,  # residual, weight, out, scale: not used without NORM
-        x,
-        x,
-        x,
         RANK=dist.get_rank(group),
         LINES=_LINES,
         SLOT=4 * _LINES * chunks,
         MAXIT=_MAXIT,
-        NORM=0,
-        HIDDEN=0,
-        GEMMA=False,
-        EPS=0.0,
         num_warps=1,
     )
     return y
@@ -146,7 +139,7 @@ def all_reduce_rmsnorm_per_token_quant(
 ):
     """
     Returns RMSNorm(residual_out) and residual_out = all_reduce(x) + residual over
-    the 4 ranks of ``group`` on gfx1250, with one launch of the all-reduce kernel.
+    the 4 ranks of ``group`` on gfx1250, with one kernel launch.
     For hidden 6144, the bits are those of ``all_reduce`` followed by
     ``aiter.add_rmsnorm`` (and with quant the per-token quant of
     ``aiter.get_hip_quant``), for finite values that are not fp32 subnormals; other
@@ -159,9 +152,8 @@ def all_reduce_rmsnorm_per_token_quant(
     scale a row, and the inboxes of ``all_reduce``.
 
     Args:
-        x, residual (torch.Tensor): Contiguous bf16 (tokens, hidden), 16-byte
-            aligned, with norm_waves(hidden) > 0: hidden is a multiple of 8, at most
-            24576.
+        x, residual (torch.Tensor): Contiguous bf16 (tokens, hidden) that
+            norm_fits: hidden is a multiple of 8, at most 24576.
         weight (torch.Tensor): Contiguous bf16 (hidden,). With gemma, the norm uses
             1 + weight.
         eps (float): The epsilon of the norm. Each value compiles a kernel.
@@ -174,17 +166,18 @@ def all_reduce_rmsnorm_per_token_quant(
         poll times out, the results are wrong and calls[-1] is more than 0.
     """
     tokens, hidden = x.shape
-    waves = norm_waves(hidden)
-    assert waves and tokens > 0
+    assert norm_fits(tokens, hidden, calls)
     assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
     assert residual.shape == x.shape and weight.shape == (hidden,)
     assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
-    for t in (x, residual, weight):
-        assert t.data_ptr() % 16 == 0
+    # The loads are 16-byte: a rank copies an operand that is not aligned, so that
+    # every rank still takes this kernel.
+    x, residual, weight = (
+        t if t.data_ptr() % 16 == 0 else t.clone() for t in (x, residual, weight)
+    )
+    waves = norm_waves(hidden)
     chunks = (calls.numel() - 1) // 2
-    # A row is whole chunks; its last chunk can be partial.
-    num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)
-    assert num_chunks <= chunks
+    num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)  # whole chunks a row
 
     _LOGGER.info(
         "ALL_REDUCE_RMSNORM_PER_TOKEN_QUANT [gluon]: x=%s quant=%s", x.shape, quant
@@ -197,13 +190,12 @@ def all_reduce_rmsnorm_per_token_quant(
     else:
         out = torch.empty_like(x)
         scale = residual_out  # not used without quant
-    _all_reduce_kernel[(triton.cdiv(num_chunks, waves) + tokens,)](
+    _all_reduce_rmsnorm_kernel[(triton.cdiv(num_chunks, waves) + tokens,)](
         x,
         residual_out,
         inboxes,
         calls,
         calls[-1:],
-        x.numel(),
         tokens,
         residual,
         weight,
