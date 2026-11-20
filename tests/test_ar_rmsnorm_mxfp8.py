@@ -78,12 +78,12 @@ def test_mxfp8_helper_returns_the_group_result():
         )
 
     assert actual is result
-    group.fused_allreduce_rmsnorm_quant.assert_called_once_with(
-        tensor,
-        tensor,
-        tensor[0],
-        1e-6,
-        True,
+    group.fused_allreduce_rmsnorm_quant.assert_called_once()
+    args, kwargs = group.fused_allreduce_rmsnorm_quant.call_args
+    assert args[0] is tensor and args[1] is tensor
+    assert torch.equal(args[2], tensor[0])
+    assert args[3:] == (1e-6, True)
+    assert kwargs == dict(
         quant_type="mxfp8",
         group_size=32,
         emit_bf16=False,

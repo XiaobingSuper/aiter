@@ -6,6 +6,7 @@ import triton
 
 from aiter.ops.triton._gluon_kernels.gfx1250.comms.all_reduce import (
     _all_reduce_kernel,
+    _all_reduce_rmsnorm_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -27,6 +28,15 @@ def norm_waves(hidden: int) -> int:
     """
     waves = triton.next_power_of_2(triton.cdiv(hidden, 12 * _LINES))
     return waves if hidden > 0 and hidden % 8 == 0 and waves <= 32 else 0
+
+
+def norm_fits(tokens: int, hidden: int, calls: torch.Tensor) -> bool:
+    """Whether the rows fit the Gluon all-reduce inbox."""
+    chunks = (calls.numel() - 1) // 2
+    return (
+        norm_waves(hidden) > 0
+        and 0 < tokens * triton.cdiv(hidden, 6 * _LINES) <= chunks
+    )
 
 
 def all_reduce_init(group, max_bytes):
