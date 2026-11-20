@@ -262,7 +262,10 @@ def fused_allreduce_rmsnorm_mxfp8_quant_fake(
     )
 
 
-@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_mxfp8_quant_fake)
+@torch_compile_guard(
+    gen_fake=fused_allreduce_rmsnorm_mxfp8_quant_fake,
+    mutates_args=[],
+)
 def fused_allreduce_rmsnorm_mxfp8_quant_(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
